@@ -17,7 +17,7 @@ class RandomPlayer(Player):
 
         msg = snapshot.time_elapsed + self.id
         if not self.is_message_valid(msg):
-            msg = msg & 0xff
+            msg = msg & 0xFF
 
         return msg
 

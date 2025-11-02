@@ -52,6 +52,12 @@ class Player(ABC):
     def is_message_valid(self, msg: int) -> bool:
         return 0 <= msg < (1 << c.ONE_BYTE)
 
+    @final
+    def can_move_to(self, x: float, y: float) -> bool:
+        curr_x, curr_y = self.position
+
+        return (abs(curr_x - x) ** 2 + abs(curr_y - y) ** 2) * 0.5 <= 1
+
     @abstractmethod
     def check_surroundings(self, snapshot: HelperSurroundingsSnapshot) -> int:
         raise Exception("not implemented")

@@ -18,8 +18,9 @@ def _create_cellview_at(
 class Sight:
     def __init__(self, position: tuple[float, float], grid: list[list[Cell]]) -> None:
         self.helper_x_real, self.helper_y_real = position
-        self.helper_x_int, self.helper_y_int = int(self.helper_x_real), int(
-            self.helper_y_real
+        self.helper_x_int, self.helper_y_int = (
+            int(self.helper_x_real),
+            int(self.helper_y_real),
         )
 
         self.west = max(self.helper_x_int - c.MAX_SIGHT_KM, 0)
