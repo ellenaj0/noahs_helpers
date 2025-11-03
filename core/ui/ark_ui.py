@@ -26,6 +26,7 @@ class ArkUI:
 
         self.screen = pygame.display.set_mode((c.SCREEN_WIDTH, c.SCREEN_HEIGHT))
         self.bg_color = c.BG_COLOR
+        self.big_font = pygame.font.Font(None, 32)
         self.small_font = pygame.font.Font(None, 20)
 
     def write_at(self, line: str, coord: tuple[float, float]):
@@ -108,10 +109,32 @@ class ArkUI:
         self.draw_helpers()
         self.draw_animals()
 
+    def draw_info_panel(self):
+        info_pane_x = c.LANDSCAPE_EAST_PX + c.MARGIN_X
+        info_pane_y = c.MARGIN_Y
+
+        info_lines = [
+            f"{self.engine.helpers[0]}",
+            "",
+            f"Turn: {self.engine.time_elapsed}/{self.engine.time}",
+            # f"Total Growth: {self.garden.total_growth():.2f}",
+            f"Helpers: {len(self.engine.helpers)}",
+            f"is_raining: {self.engine.is_raining()}",
+            # "",
+            # f"{'PAUSED' if self.paused else 'RUNNING'}",
+            # f"{'DEBUG ON' if self.debug_mode else 'DEBUG OFF'}",  # NEW: Show debug status
+        ]
+
+        for i, line in enumerate(info_lines):
+            y = info_pane_y + i * 30
+            if line:  # Skip empty debug line when not in debug mode
+                text = self.big_font.render(line, True, (0, 0, 0))
+                self.screen.blit(text, (info_pane_x, y))
+
     def step_simulation(self):
         """Run one turn of simulation."""
-        if self.turn < self.engine.time:
-            self.engine.run_turn(self.turn)
+        if self.engine.time_elapsed < self.engine.time:
+            self.engine.run_turn()
             self.turn += 1
         else:
             self.paused = True
@@ -142,16 +165,16 @@ class ArkUI:
 
             if not self.paused:
                 self.step_simulation()
-                self.clock.tick(40)
+                # self.clock.tick(40)
 
             self.screen.fill(self.bg_color)
             self.draw_grid()
             self.draw_objects()
-            # self.draw_info_panel()
+            self.draw_info_panel()
             # self.draw_debug_info()
 
             pygame.display.flip()
-            self.clock.tick(60)
+            self.clock.tick(100)
 
         pygame.quit()
 

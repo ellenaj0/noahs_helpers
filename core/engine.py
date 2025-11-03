@@ -26,6 +26,7 @@ class Engine:
         self.helpers = helpers
         self.time = time
         self.free_animals = animals
+        self.time_elapsed = 0
 
     def _get_sights(self) -> dict[Player, list[Player]]:
         in_sight: dict[Player, list[Player]] = {helper: [] for helper in self.helpers}
@@ -39,11 +40,12 @@ class Engine:
 
         return in_sight
 
-    def run_turn(self, time_elapsed: int) -> None:
-        is_raining = time_elapsed >= self.time - c.START_RAIN
-        ark_view = self.ark.get_view()
+    def is_raining(self) -> bool:
+        return self.time_elapsed >= self.time - c.START_RAIN
 
-        print(f"time_elapsed: {time_elapsed}, is_raining: {is_raining}")
+    def run_turn(self) -> None:
+        is_raining = self.is_raining()
+        ark_view = self.ark.get_view()
 
         # 1. show helpers their new surroundings:
         # a their position
@@ -68,7 +70,7 @@ class Engine:
                 helper_ark_view = ark_view
 
             snapshot = HelperSurroundingsSnapshot(
-                time_elapsed, is_raining, helper.position, sight, helper_ark_view
+                self.time_elapsed, is_raining, helper.position, sight, helper_ark_view
             )
             one_byte_message = helper.check_surroundings(snapshot)
             if not (0 <= one_byte_message < c.ONE_BYTE):
@@ -144,6 +146,8 @@ class Engine:
                 # this is ok as we're not changing the keys
                 self.free_animals[animal] = neighbor
 
+        self.time_elapsed += 1
+
     def run_simulation(self) -> None:
-        for time_elapsed in range(self.time):
-            self.run_turn(time_elapsed)
+        while self.time_elapsed < self.time:
+            self.run_turn()

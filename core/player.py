@@ -19,7 +19,7 @@ class Player(ABC):
         self.flock: set[Animal] = set()
 
     def __str__(self) -> str:
-        return f"{self.__module__}(id={self.id})"
+        return f"{self.__module__.split('.')[-1]}"
 
     def __repr__(self) -> str:
         return str(self)
