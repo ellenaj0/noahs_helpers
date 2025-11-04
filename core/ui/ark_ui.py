@@ -1,3 +1,4 @@
+from typing import Literal
 import pygame
 
 from core.animal import Animal, Gender
@@ -40,8 +41,8 @@ class ArkUI:
 
         self.screen = pygame.display.set_mode((c.SCREEN_WIDTH, c.SCREEN_HEIGHT))
         self.bg_color = c.BG_COLOR
-        self.big_font = pygame.font.Font(None, 32)
-        self.small_font = pygame.font.Font(None, 20)
+        self.big_font = pygame.font.Font(None, 36)
+        self.small_font = pygame.font.Font(None, 28)
 
         self.debug_mode = False
 
@@ -49,9 +50,29 @@ class ArkUI:
             tuple[tuple[float, float], float], Ark | Player | Animal
         ] = {}
 
-    def write_at(self, line: str, coord: tuple[float, float]):
-        text = self.small_font.render(line, True, (0, 0, 0))
-        self.screen.blit(text, coord)
+    def write_at(
+        self,
+        font: pygame.font.Font,
+        line: str,
+        coord: tuple[int, int],
+        align: Literal["left", "center", "right"] = "center",
+    ):
+        text = font.render(line, True, (0, 0, 0))
+
+        # get rectangle to center the text
+        match align:
+            case x if x == "left":
+                rect = text.get_rect()
+                rect.midleft = coord
+            case x if x == "center":
+                rect = text.get_rect(center=coord)
+            case x if x == "right":
+                rect = text.get_rect()
+                rect.midright = coord
+            case _:
+                raise Exception(f"invalid value for `align`: {align}")
+
+        self.screen.blit(text, rect)
 
     def draw_grid(self):
         """Draw garden boundaries and grid."""
@@ -62,7 +83,7 @@ class ArkUI:
         pygame.draw.rect(self.screen, (0, 0, 0), border_rect, 2)  # border
 
         for i in range(c.NUM_GRID_LINES + 1):
-            x = c.MARGIN_X + c.LANDSCAPE_WIDTH * i / c.NUM_GRID_LINES
+            x = c.MARGIN_X + int(c.LANDSCAPE_WIDTH * i / c.NUM_GRID_LINES)
 
             if i not in [0, c.NUM_GRID_LINES]:
                 # only draw lines inside the grid
@@ -73,14 +94,14 @@ class ArkUI:
                     (x, c.MARGIN_Y + c.LANDSCAPE_HEIGHT),
                 )
 
-            line = "  X"
+            line = "X"
             if i:
                 val = c.X * i / c.NUM_GRID_LINES
                 line = f"{int(val)}" if val.is_integer() else f"{val:.1f}"
-            self.write_at(line, (x - 5, c.MARGIN_Y - 20))
+            self.write_at(self.small_font, line, (x, c.MARGIN_Y - 20))
 
         for i in range(c.NUM_GRID_LINES + 1):
-            y = c.MARGIN_Y + c.LANDSCAPE_HEIGHT * i / c.NUM_GRID_LINES
+            y = c.MARGIN_Y + int(c.LANDSCAPE_HEIGHT * i / c.NUM_GRID_LINES)
 
             if i not in [0, c.NUM_GRID_LINES]:
                 pygame.draw.line(
@@ -90,11 +111,11 @@ class ArkUI:
                     (c.MARGIN_X + c.LANDSCAPE_WIDTH, y),
                 )
 
-            line = "  Y"
+            line = "Y"
             if i:
                 val = c.Y * i / c.NUM_GRID_LINES
                 line = f"{int(val)}" if val.is_integer() else f"{val:.1f}"
-            self.write_at(line, (c.MARGIN_X - 30, y - 5))
+            self.write_at(self.small_font, line, (c.MARGIN_X - 10, y), align="right")
 
     def draw_ark(self):
         ark_x, ark_y = self.engine.ark.position
@@ -105,19 +126,64 @@ class ArkUI:
         key = (ark_center, c.ARK_RADIUS)
         self.drawn_objects[key] = self.engine.ark
 
-    def draw_hovered_ark(self):
-        cw = c.SCREEN_WIDTH / 2
-        ch = c.SCREEN_HEIGHT / 2
+    def draw_hovered_ark(self, pos: tuple[int, int], animals: set[Animal]):
+        cw = int(c.SCREEN_WIDTH / 2)
+        ch = int(c.SCREEN_HEIGHT / 2)
+
+        left = cw - int(c.HOVERED_WIDTH / 2)
+        top = ch - int(c.HOVERED_HEIGHT / 2)
 
         rect = pygame.Rect(
-            cw - c.HOVERED_WIDTH / 2,
-            ch - c.HOVERED_HEIGHT / 2,
+            left,
+            top,
             c.HOVERED_WIDTH,
             c.HOVERED_HEIGHT,
         )
 
         pygame.draw.rect(self.screen, c.BG_COLOR, rect)
-        self.write_at("ARK", (cw - 10, ch - c.HOVERED_HEIGHT / 2 + 10))
+        self.write_at(self.big_font, "ARK", (cw, ch - int(c.HOVERED_HEIGHT / 2) + 15))
+
+        margined_x = left + c.HOVERED_MARGIN_X
+        self.write_at(
+            self.small_font,
+            f"pos: {pos}",
+            (margined_x, top + c.MARGIN_Y),
+            align="left",
+        )
+
+        species_in_ark: dict[int, list[bool]] = {
+            sid: [False, False] for sid in self.engine.species_stats.keys()
+        }
+
+        for animal in animals:
+            sid = animal.species_id
+            if animal.gender == Gender.Male:
+                species_in_ark[sid][0] = True
+            elif animal.gender == Gender.Female:
+                species_in_ark[sid][1] = True
+
+        y = top + c.MARGIN_Y * 2
+        for sid, (has_male, has_female) in species_in_ark.items():
+            self.write_at(self.small_font, f"{sid}: ", (margined_x, y), align="left")
+
+            side = 40
+            offset = 40
+
+            male_rect = pygame.Rect(margined_x + offset, y - int(side / 2), side, side)
+            female_rect = pygame.Rect(
+                margined_x + offset + 5 + side, y - int(side / 2), side, side
+            )
+            if has_male:
+                pygame.draw.rect(self.screen, c.MALE_ANIMAL_COLOR, male_rect)
+            else:
+                pygame.draw.rect(self.screen, c.MALE_ANIMAL_COLOR, male_rect, 2)
+
+            if has_female:
+                pygame.draw.rect(self.screen, c.FEMALE_ANIMAL_COLOR, female_rect)
+            else:
+                pygame.draw.rect(self.screen, c.FEMALE_ANIMAL_COLOR, female_rect, 2)
+
+            y += 50
 
     def draw_helpers(self):
         for helper in self.engine.helpers:
@@ -157,8 +223,7 @@ class ArkUI:
 
                 match object:
                     case Ark(position=p, animals=a):
-                        print(f"hovering ARK, pos={p}, animals={a}")
-                        self.draw_hovered_ark()
+                        self.draw_hovered_ark(p, a)
                     case Player(id=id, position=p, flock=f):
                         print(f"hovering PLAYER, id={id}, pos={p}, flock={f}")
                     case Animal(species_id=s, gender=g):
@@ -189,11 +254,15 @@ class ArkUI:
             f"{'DEBUG ON' if self.debug_mode else 'DEBUG OFF'}",  # NEW: Show debug status
         ]
 
+        last = 0
         for i, line in enumerate(info_lines):
             y = info_pane_y + i * 30
             if line:  # Skip empty debug line when not in debug mode
                 text = self.big_font.render(line, True, (0, 0, 0))
                 self.screen.blit(text, (info_pane_x, y))
+            last = y
+
+        # species = {sid: }
 
     def draw_debug_helper_screens(self):
         grid = pygame.Rect(
@@ -263,7 +332,7 @@ class ArkUI:
                 self.step_simulation()
 
             pygame.display.flip()
-            self.clock.tick(10)
+            self.clock.tick(60)
 
         pygame.quit()
 

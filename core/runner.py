@@ -45,17 +45,22 @@ class ArkRunner:
 
         # generate animals in landscape
         animals: dict[Animal, Cell] = {}
+        species_stats: dict[int, list[int]] = {}
 
         for species_id, count in enumerate(self.animals):
             first_male = Animal(species_id, Gender.Male)
             first_female = Animal(species_id, Gender.Female)
             group = [first_male, first_female]
 
+            species_stats[species_id] = [1, 1]
+
             for _ in range(count - 2):
                 if random.random() < 0.5:
-                    group.append(Animal(species_id, Gender.Female))
-                else:
                     group.append(Animal(species_id, Gender.Male))
+                    species_stats[species_id][0] += 1
+                else:
+                    group.append(Animal(species_id, Gender.Female))
+                    species_stats[species_id][1] += 1
 
             # place animals in random cells
             for animal in group:
@@ -70,7 +75,9 @@ class ArkRunner:
             self.player_class(id, *self.ark.position) for id in range(self.num_helpers)
         ]
 
-        engine = Engine(self.grid, self.ark, self.helpers, self.time, animals)
+        engine = Engine(
+            self.grid, self.ark, self.helpers, self.time, animals, species_stats
+        )
 
         return engine
 

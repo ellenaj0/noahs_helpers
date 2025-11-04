@@ -20,12 +20,14 @@ class Engine:
         helpers: list[Player],
         time: int,
         animals: dict[Animal, Cell],
+        species_stats: dict[int, list[int]],
     ) -> None:
         self.grid = grid
         self.ark = ark
         self.helpers = helpers
         self.time = time
         self.free_animals = animals
+        self.species_stats = species_stats
         self.time_elapsed = 0
 
     def _get_sights(self) -> dict[Player, list[Player]]:
