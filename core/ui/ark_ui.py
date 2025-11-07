@@ -53,8 +53,6 @@ class ArkUI:
             self.engine.ark.position[1] // (c.Y // c.MAP_SPLIT),
         )
 
-        print(f"selected: {self.selected_cell}")
-
     def coords_fit_in_grid(self, x: float, y: float) -> bool:
         west_x, east_x, north_y, south_y = self.get_w_e_n_s()
 
@@ -413,7 +411,7 @@ class ArkUI:
         match best_obj:
             case Ark(position=p):
                 self.draw_hovered_ark(p)
-            case Player(id=id, position=p, flock=f) as player:
+            case Player() as player:
                 self.draw_hovered_helper(player)
             case Animal(species_id=sid, gender=g):
                 cell = self.engine.free_animals[best_obj]
@@ -479,7 +477,7 @@ class ArkUI:
 
         y = base_y
         x = info_pane_x + 190
-        write_at(self.screen, self.big_font, f"Helpers", (x, y), align="left")
+        write_at(self.screen, self.big_font, "Helpers", (x, y), align="left")
         for helper in self.engine.helpers:
             if helper.kind == Kind.Noah:
                 continue

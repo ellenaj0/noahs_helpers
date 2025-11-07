@@ -9,7 +9,6 @@ class Ark:
         position: tuple[int, int],
         species_stats: dict[int, list[int]],
     ) -> None:
-
         self.position = position
         self.animals: set[Animal] = set()
         self.species_stats = species_stats

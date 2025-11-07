@@ -101,7 +101,7 @@ class Engine:
             action = helper.get_action(messages_to[helper])
 
             if helper.kind == Kind.Noah and action is not None:
-                raise Exception(f"Noah shouldn't perform an action")
+                raise Exception("Noah shouldn't perform an action")
 
             match action:
                 case Release(animal=a):

@@ -129,7 +129,7 @@ class Player(ABC):
         self, screen: pygame.Surface, font: pygame.font.Font, start_pos: tuple[int, int]
     ):
         if self.kind == Kind.Noah:
-            raise Exception(f"Noah doesn't have a flock")
+            raise Exception("Noah doesn't have a flock")
 
         x, y = start_pos
         flist = list(self.flock) + [None] * (c.MAX_FLOCK_SIZE - len(self.flock))
