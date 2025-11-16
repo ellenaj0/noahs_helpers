@@ -323,14 +323,17 @@ class Player5(Player):
         # --- SECOND HIGHEST PRIORITY: RELEASE DUPLICATES ALREADY ON ARK ---
         for animal in list(self.flock):
             species_id = animal.species_id
-
+            '''
             male_obtained = (species_id, Gender.Male) in self.obtained_species
             female_obtained = (species_id, Gender.Female) in self.obtained_species
 
             if male_obtained and female_obtained:
                 # Release if both genders are saved on the Ark
                 self.animal_target_cell = None
-                return Release(animal=animal)
+                print(self.id)
+                print("2")
+                print("----")
+                return Release(animal=animal)'''
 
         # --- NEXT PRIORITY: IMMEDIATE OBTAIN IN CURRENT CELL ---
         if len(self.flock) < c.MAX_FLOCK_SIZE:
