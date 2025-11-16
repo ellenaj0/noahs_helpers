@@ -1,4 +1,4 @@
-from random import random, choice
+from random import random
 from core.action import Action, Move, Obtain, Release
 from core.message import Message
 from core.player import Player
@@ -8,7 +8,7 @@ from core.views.cell_view import CellView
 from core.animal import Gender
 import core.constants as c
 import math
-from typing import Set, Tuple, List, Optional
+from typing import Set, Tuple, Optional
 
 # --- Constants for Player5 Logic ---
 TURN_ADJUSTMENT_RAD = math.radians(0.5)
@@ -75,7 +75,7 @@ class Player5(Player):
             if animal.gender != Gender.Unknown:
                 ark_set.add((animal.species_id, animal.gender))
 
-                sorted_ark_list = sorted(list(ark_set), key=lambda x: x[0])
+                # sorted_ark_list = sorted(list(ark_set), key=lambda x: x[0])
                 # 2. Print the sorted list
                 # print(sorted_ark_list)
                 # print("------")
