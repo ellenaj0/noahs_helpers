@@ -54,9 +54,7 @@ class Player5(Player):
         self.base_angle = (2 * math.pi * (self.id - 1)) / int(h)
         self.is_exploring_fan_out = True
 
-        # hopefully this is temporary...
-        self.time_elapsed = 0
-        self.ignore_list = []
+        self.ignore_list = [] # List of species_ids where internal duplicates were found
 
     # --- Player5 Helper Methods ---
 
@@ -64,37 +62,34 @@ class Player5(Player):
         """Calculates Euclidean distance between two points."""
         return math.sqrt((p1[0] - p2[0]) ** 2 + (p1[1] - p2[1]) ** 2)
 
-    def _update_obtained_species(self, ark_animals: Set):
+    def _update_obtained_species_from_ark(self, ark_animals: Set):
         """
-        Updates the set of species/genders already saved on the Ark.
-        This updates the list based on the Ark's view, ensuring external knowledge is captured.
+        Updates the set based on animals CONFIRMED to be on the Ark.
         """
-        # Create a set of newly observed species/genders from the Ark's current view
         ark_set: Set[SpeciesGender] = set()
         for animal in ark_animals:
             if animal.gender != Gender.Unknown:
                 ark_set.add((animal.species_id, animal.gender))
 
-        print(sorted(ark_set, key=lambda x: x[0]))
-        print("------")
-        # Merge Ark's list into helper's memory
-        self.ignore_list.clear()
+                sorted_ark_list = sorted(list(ark_set), key=lambda x: x[0])
+                # 2. Print the sorted list
+                print(sorted_ark_list)
+                print("------")
+
+        self.ignore_list.clear() # Clear ignore list upon full Ark sync
         self.obtained_species.update(ark_set)
 
     def _is_species_needed(self, species_id: int, gender: Gender) -> bool:
         """
         Checks if an animal is needed based on gender.
-        Needed if the species/gender pair is NOT in self.obtained_species.
         """
         if species_id in self.ignore_list:
             return False
         if gender == Gender.Unknown:
-            # Needed if AT LEAST ONE gender is missing (NOT both obtained)
             male_obtained = (species_id, Gender.Male) in self.obtained_species
             female_obtained = (species_id, Gender.Female) in self.obtained_species
             return not (male_obtained and female_obtained)
         else:
-            # Needed if the specific known gender is missing
             return (species_id, gender) not in self.obtained_species
 
     def _get_move_to_target(
@@ -210,13 +205,24 @@ class Player5(Player):
         self.position = snapshot.position
         self.sight = snapshot.sight
         self.is_raining = snapshot.is_raining
+        self.time_elapsed = snapshot.time_elapsed 
 
-        if self.kind != Kind.Noah and snapshot.ark_view:
-            self._update_obtained_species(snapshot.ark_view.animals)
+        # --- CRITICAL FIX 1: Update self.flock from the snapshot ---
+        self.flock = snapshot.flock.copy() 
+
+        if self.kind != Kind.Noah:
+            # Update based on confirmed Ark list (only when Ark view is available)
+            if snapshot.ark_view:
+                self._update_obtained_species_from_ark(snapshot.ark_view.animals)
+            
+            # CRITICAL FIX 2: Update obtained_species based on the fresh self.flock contents every turn
+            for animal in self.flock:
+                if animal.gender != Gender.Unknown:
+                    self.obtained_species.add((animal.species_id, animal.gender))
 
         self.previous_position = self.position
 
-        # Clear target if we were chasing and are now in the *old* target cell (it should be caught or moved)
+        # Clear target if we were chasing and are now in the *old* target cell
         if self.animal_target_cell and self.position_is_in_cell(
             self.animal_target_cell.x, self.animal_target_cell.y
         ):
@@ -224,16 +230,12 @@ class Player5(Player):
 
         return 0
 
-    # we really don't need this if the simulator works as intended... or im just dumb
-    def _add_flock_to_obtained_species(self):
-        """Adds all animals currently in the helper's flock to the obtained_species set."""
-        for animal in self.flock:
-            # Animals in the flock should always have a known gender
-            if animal.gender != Gender.Unknown:
-                self.obtained_species.add((animal.species_id, animal.gender))
-
     def get_action(self, messages: list[Message]) -> Action | None:
-        self.time_elapsed += 1
+        
+        # --- TURN-BASED ACTION: Clear ignore_list every 250 turns ---
+        if self.time_elapsed > 0 and self.time_elapsed % 250 == 0:
+            self.ignore_list.clear()
+
         # Noah doesn't act
         if self.kind == Kind.Noah:
             return None
@@ -241,16 +243,8 @@ class Player5(Player):
         current_x, current_y = self.position
         current_pos = (current_x, current_y)
 
-        self._add_flock_to_obtained_species()
-
+        # --- HIGHEST PRIORITY: RELEASE INTERNAL FLOCK DUPLICATES ---
         flock_keys = [(a.species_id, a.gender) for a in self.flock]
-
-        # Find the first animal 'a' in the flock whose (species_id, gender) key count is > 1.
-        # If found, set the action to Release(animal=a).
-
-        if self.time_elapsed % 250 == 0:
-            # Assumes self.ignore_list is a set[int]
-            self.ignore_list.clear()
 
         duplicate_to_release = next(
             (
@@ -260,28 +254,26 @@ class Player5(Player):
             ),
             None,
         )
+        
 
         if duplicate_to_release:
             self.ignore_list.append(duplicate_to_release.species_id)
+            self.animal_target_cell = None
             return Release(animal=duplicate_to_release)
-        """
-        if len(self.flock) >= 4:
-            for animal in list(self.flock):
-                species_id = animal.species_id
-                
-                male_obtained = (species_id, Gender.Male) in self.obtained_species
-                female_obtained = (species_id, Gender.Female) in self.obtained_species
-                
-                if male_obtained and female_obtained:
-                    self.animal_target_cell = None
-                    return Release(animal=animal) 
-        print(self.obtained_species)
-        print(self.flock)
-        print(self.id)
-        print(self.ignore_list)
-        print("------")"""
 
-        # --- NEXT PRIORITY: IMMEDIATE OBTAIN IN CURRENT CELL (AND UPDATE STATE) ---
+        # --- SECOND HIGHEST PRIORITY: RELEASE DUPLICATES ALREADY ON ARK ---
+        for animal in list(self.flock):
+            species_id = animal.species_id
+            
+            male_obtained = (species_id, Gender.Male) in self.obtained_species
+            female_obtained = (species_id, Gender.Female) in self.obtained_species
+            
+            if male_obtained and female_obtained:
+                # Release if both genders are saved on the Ark
+                self.animal_target_cell = None
+                return Release(animal=animal) 
+
+        # --- NEXT PRIORITY: IMMEDIATE OBTAIN IN CURRENT CELL ---
         if len(self.flock) < c.MAX_FLOCK_SIZE:
             current_cell_x, current_cell_y = int(current_x), int(current_y)
 
@@ -293,32 +285,32 @@ class Player5(Player):
                 current_cell_view = None
 
             if current_cell_view and current_cell_view.animals:
-                # Find the first obtainable animal in the current cell
-                animal_to_obtain = next(iter(current_cell_view.animals))
+                
+                # Filter out animals already in the helper's flock
+                obtainable_animals = [
+                    animal 
+                    for animal in current_cell_view.animals 
+                    if animal not in self.flock
+                ]
 
-                is_needed = self._is_species_needed(
-                    animal_to_obtain.species_id, animal_to_obtain.gender
-                )
-
-                # if is_needed:
-                # FIX: Update the helper's memory immediately upon successful capture request
-                # self.obtained_species.add((animal_to_obtain.species_id, animal_to_obtain.gender))
-                # if is_needed: #I hate evenrything
-                self.animal_target_cell = None
-                return Obtain(animal=animal_to_obtain)
-
-                # If it's a duplicate, we don't obtain it, but we still clear the chase target
-                self.animal_target_cell = None
+                if obtainable_animals:
+                    # Find the first obtainable animal in the current cell
+                    animal_to_obtain = next(iter(obtainable_animals))
+                    self.animal_target_cell = None
+                    return Obtain(animal=animal_to_obtain)
+                
+                # If no animals are left after filtering, clear target
+                else:
+                    self.animal_target_cell = None 
 
         # 1. Targeted Animal Collection Phase (Handles moving TO the target cell)
-
+        
         if self.animal_target_cell:
             target_cell_x, target_cell_y = (
                 self.animal_target_cell.x,
                 self.animal_target_cell.y,
             )
 
-            # This handles the movement toward the target cell center
             target_cell_center = (target_cell_x + 0.5, target_cell_y + 0.5)
             return self._get_move_to_target(current_pos, target_cell_center)
 
