@@ -51,7 +51,11 @@ class Player5(Player):
         self.animal_target_cell: Optional[CellView] = None
 
         h = num_helpers
-        self.base_angle = (2 * math.pi * (self.id - 1)) / int(h)
+        # calc fan-out angle and exclude noah since he stays on boat
+        if self.id > 0:
+            self.base_angle = (2 * math.pi * (self.id - 1)) / (int(h) - 1)
+        else:
+            self.base_angle = 0
         self.is_exploring_fan_out = True
 
         self.ignore_list = [] # List of species_ids where internal duplicates were found
@@ -73,8 +77,8 @@ class Player5(Player):
 
                 sorted_ark_list = sorted(list(ark_set), key=lambda x: x[0])
                 # 2. Print the sorted list
-                print(sorted_ark_list)
-                print("------")
+                # print(sorted_ark_list)
+                # print("------")
 
         self.ignore_list.clear() # Clear ignore list upon full Ark sync
         self.obtained_species.update(ark_set)
@@ -101,8 +105,9 @@ class Player5(Player):
 
         dist = self._get_distance(current_pos, target_pos)
 
+        # if at target, just return target pos
         if dist < c.EPS:
-            return self._get_new_random_target(current_pos)
+            return Move(x=target_pos[0], y=target_pos[1])
 
         move_dist = min(dist, c.MAX_DISTANCE_KM)
 
@@ -157,27 +162,40 @@ class Player5(Player):
 
         return Move(x=current_x + random() - 0.5, y=current_y + random() - 0.5)
 
-    def _get_return_move(self, current_pos: Tuple[float, float]) -> Move:
-        """Calculates a move to return to the Ark (indirectly if far, directly if near)."""
+    def _get_return_move(self, current_pos: Tuple[float, float], direct: bool = False) -> Move:
+        """Calculates a move to return to the Ark.
+
+        Args:
+            current_pos: Current position
+            direct: If True, go straight to ark. If False, spiral/arc toward ark to explore.
+        """
         current_dist_to_ark = self._get_distance(current_pos, self.ark_pos)
 
-        if current_dist_to_ark <= NEAR_ARK_DISTANCE:
+        if direct or current_dist_to_ark <= NEAR_ARK_DISTANCE:
             self.current_target_pos = self.ark_pos
             return self._get_move_to_target(current_pos, self.ark_pos)
+        # spiral approach
         else:
-            max_tries = 20
-            for _ in range(max_tries):
-                target_x = random() * (MAX_MAP_COORD - MIN_MAP_COORD) + MIN_MAP_COORD
-                target_y = random() * (MAX_MAP_COORD - MIN_MAP_COORD) + MIN_MAP_COORD
-                target_pos = (target_x, target_y)
 
-                dist_target_to_ark = self._get_distance(target_pos, self.ark_pos)
-                if dist_target_to_ark < current_dist_to_ark:
-                    self.current_target_pos = target_pos
-                    return self._get_move_to_target(current_pos, target_pos)
+            # calc angle from ark to current position
+            dx = current_pos[0] - self.ark_pos[0]
+            dy = current_pos[1] - self.ark_pos[1]
+            current_angle = math.atan2(dy, dx)
 
-            self.current_target_pos = self.ark_pos
-            return self._get_move_to_target(current_pos, self.ark_pos)
+            # add perpendicular offset to create arc offset based on helper ID for variety
+            arc_offset = math.radians(30) * (1 if self.id % 2 == 0 else -1)
+            spiral_angle = current_angle + arc_offset
+
+            # move toward ark but offset to the side 90% of current distance in spiral direction
+            target_dist = current_dist_to_ark * 0.9
+            target_x = self.ark_pos[0] + math.cos(spiral_angle) * target_dist
+            target_y = self.ark_pos[1] + math.sin(spiral_angle) * target_dist
+
+            target_x = max(MIN_MAP_COORD, min(MAX_MAP_COORD, target_x))
+            target_y = max(MIN_MAP_COORD, min(MAX_MAP_COORD, target_y))
+
+            self.current_target_pos = (target_x, target_y)
+            return self._get_move_to_target(current_pos, (target_x, target_y))
 
     def _find_needed_animal_in_sight(self) -> Optional[CellView]:
         """Scans sight for an animal that is NOT shepherded and is still needed."""
@@ -199,13 +217,41 @@ class Player5(Player):
         current_x, current_y = self.position
         return int(current_x) == cell_x and int(current_y) == cell_y
 
+    def _get_turns_remaining_until_end(self) -> Optional[int]:
+        """
+        return turns remaining until simulation ends, or None if not raining yet
+        """
+        if not self.is_raining or self.rain_start_time is None:
+            return None
+        
+        turns_since_rain = self.time_elapsed - self.rain_start_time
+
+        return c.START_RAIN - turns_since_rain
+
+    def _get_turns_to_reach_ark(self, from_pos: Optional[Tuple[float, float]] = None) -> int:
+        """
+        calc min turns needed to reach ark from current or given position
+        """
+        pos = from_pos if from_pos else self.position
+        distance = self._get_distance(pos, self.ark_pos)
+
+        return int(math.ceil(distance / c.MAX_DISTANCE_KM))
+
     # --- Core Methods ---
 
     def check_surroundings(self, snapshot: HelperSurroundingsSnapshot):
         self.position = snapshot.position
         self.sight = snapshot.sight
+
+        # track when rain starts
+        if snapshot.is_raining and not self.is_raining:
+            self.rain_start_time = snapshot.time_elapsed
+
         self.is_raining = snapshot.is_raining
         self.time_elapsed = snapshot.time_elapsed 
+
+        # track if at ark
+        self.at_ark = snapshot.ark_view is not None
 
         # --- CRITICAL FIX 1: Update self.flock from the snapshot ---
         self.flock = snapshot.flock.copy() 
@@ -323,10 +369,42 @@ class Player5(Player):
                 return self._get_move_to_target(current_pos, target_cell_center)
 
         # 2. Movement Phase (Return or Explore)
+        if self.is_raining:
+            turns_remaining = self._get_turns_remaining_until_end()
+            turns_needed = self._get_turns_to_reach_ark()
 
-        # Emergency Rain Return
-        if self.is_raining and self.time_elapsed >= self.time - c.START_RAIN:
-            return self._get_return_move(current_pos)
+            if turns_remaining is not None:
+                time_buffer = turns_remaining - turns_needed
+                distance_to_ark = self._get_distance(current_pos, self.ark_pos)
+
+                # must return immediately and DIRECTLY if cutting it close
+                if time_buffer < 50:
+                    return self._get_return_move(current_pos, direct=True)
+
+                if distance_to_ark < 200 and time_buffer > 200:
+                    # if flock is full, drop them off and go back out
+                    if len(self.flock) >= 3:
+                        return self._get_return_move(current_pos, direct=True)
+
+                # medium distance with decent time
+                elif distance_to_ark < 500 and time_buffer > 100:
+                    # if actively chasing an animal and it's close, finish getting it
+                    if self.animal_target_cell and len(self.flock) < c.MAX_FLOCK_SIZE:
+                        target_dist = self._get_distance(current_pos, (self.animal_target_cell.x + 0.5, self.animal_target_cell.y + 0.5))
+
+                        if target_dist < 15:
+                            # continue to animal targeting logic below
+                            pass
+                        else:
+                            self.animal_target_cell = None
+                            return self._get_return_move(current_pos, direct=False)
+                    else:
+                        # no active target. return using spiral path
+                        return self._get_return_move(current_pos, direct=False)
+
+                # far or no time, return immediately and directly
+                else:
+                    return self._get_return_move(current_pos, direct=True)
 
         # Loaded Return
         if len(self.flock) >= 3:
