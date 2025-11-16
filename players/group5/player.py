@@ -58,7 +58,7 @@ class Player5(Player):
             self.base_angle = 0
         self.is_exploring_fan_out = True
 
-        self.ignore_list = [] # List of species_ids where internal duplicates were found
+        self.ignore_list = []  # List of species_ids where internal duplicates were found
 
     # --- Player5 Helper Methods ---
 
@@ -80,7 +80,7 @@ class Player5(Player):
                 # print(sorted_ark_list)
                 # print("------")
 
-        self.ignore_list.clear() # Clear ignore list upon full Ark sync
+        self.ignore_list.clear()  # Clear ignore list upon full Ark sync
         self.obtained_species.update(ark_set)
 
     def _is_species_needed(self, species_id: int, gender: Gender) -> bool:
@@ -162,7 +162,9 @@ class Player5(Player):
 
         return Move(x=current_x + random() - 0.5, y=current_y + random() - 0.5)
 
-    def _get_return_move(self, current_pos: Tuple[float, float], direct: bool = False) -> Move:
+    def _get_return_move(
+        self, current_pos: Tuple[float, float], direct: bool = False
+    ) -> Move:
         """Calculates a move to return to the Ark.
 
         Args:
@@ -176,7 +178,6 @@ class Player5(Player):
             return self._get_move_to_target(current_pos, self.ark_pos)
         # spiral approach
         else:
-
             # calc angle from ark to current position
             dx = current_pos[0] - self.ark_pos[0]
             dy = current_pos[1] - self.ark_pos[1]
@@ -223,12 +224,14 @@ class Player5(Player):
         """
         if not self.is_raining or self.rain_start_time is None:
             return None
-        
+
         turns_since_rain = self.time_elapsed - self.rain_start_time
 
         return c.START_RAIN - turns_since_rain
 
-    def _get_turns_to_reach_ark(self, from_pos: Optional[Tuple[float, float]] = None) -> int:
+    def _get_turns_to_reach_ark(
+        self, from_pos: Optional[Tuple[float, float]] = None
+    ) -> int:
         """
         calc min turns needed to reach ark from current or given position
         """
@@ -248,19 +251,19 @@ class Player5(Player):
             self.rain_start_time = snapshot.time_elapsed
 
         self.is_raining = snapshot.is_raining
-        self.time_elapsed = snapshot.time_elapsed 
+        self.time_elapsed = snapshot.time_elapsed
 
         # track if at ark
         self.at_ark = snapshot.ark_view is not None
 
         # --- CRITICAL FIX 1: Update self.flock from the snapshot ---
-        self.flock = snapshot.flock.copy() 
+        self.flock = snapshot.flock.copy()
 
         if self.kind != Kind.Noah:
             # Update based on confirmed Ark list (only when Ark view is available)
             if snapshot.ark_view:
                 self._update_obtained_species_from_ark(snapshot.ark_view.animals)
-            
+
             # CRITICAL FIX 2: Update obtained_species based on the fresh self.flock contents every turn
             for animal in self.flock:
                 if animal.gender != Gender.Unknown:
@@ -277,7 +280,6 @@ class Player5(Player):
         return 0
 
     def get_action(self, messages: list[Message]) -> Action | None:
-        
         # --- TURN-BASED ACTION: Clear ignore_list every 250 turns ---
         if self.time_elapsed > 0 and self.time_elapsed % 250 == 0:
             self.ignore_list.clear()
@@ -300,7 +302,6 @@ class Player5(Player):
             ),
             None,
         )
-        
 
         if duplicate_to_release:
             self.ignore_list.append(duplicate_to_release.species_id)
@@ -310,14 +311,14 @@ class Player5(Player):
         # --- SECOND HIGHEST PRIORITY: RELEASE DUPLICATES ALREADY ON ARK ---
         for animal in list(self.flock):
             species_id = animal.species_id
-            
+
             male_obtained = (species_id, Gender.Male) in self.obtained_species
             female_obtained = (species_id, Gender.Female) in self.obtained_species
-            
+
             if male_obtained and female_obtained:
                 # Release if both genders are saved on the Ark
                 self.animal_target_cell = None
-                return Release(animal=animal) 
+                return Release(animal=animal)
 
         # --- NEXT PRIORITY: IMMEDIATE OBTAIN IN CURRENT CELL ---
         if len(self.flock) < c.MAX_FLOCK_SIZE:
@@ -331,11 +332,10 @@ class Player5(Player):
                 current_cell_view = None
 
             if current_cell_view and current_cell_view.animals:
-                
                 # Filter out animals already in the helper's flock
                 obtainable_animals = [
-                    animal 
-                    for animal in current_cell_view.animals 
+                    animal
+                    for animal in current_cell_view.animals
                     if animal not in self.flock
                 ]
 
@@ -344,13 +344,13 @@ class Player5(Player):
                     animal_to_obtain = next(iter(obtainable_animals))
                     self.animal_target_cell = None
                     return Obtain(animal=animal_to_obtain)
-                
+
                 # If no animals are left after filtering, clear target
                 else:
-                    self.animal_target_cell = None 
+                    self.animal_target_cell = None
 
         # 1. Targeted Animal Collection Phase (Handles moving TO the target cell)
-        
+
         if self.animal_target_cell:
             target_cell_x, target_cell_y = (
                 self.animal_target_cell.x,
@@ -390,7 +390,13 @@ class Player5(Player):
                 elif distance_to_ark < 500 and time_buffer > 100:
                     # if actively chasing an animal and it's close, finish getting it
                     if self.animal_target_cell and len(self.flock) < c.MAX_FLOCK_SIZE:
-                        target_dist = self._get_distance(current_pos, (self.animal_target_cell.x + 0.5, self.animal_target_cell.y + 0.5))
+                        target_dist = self._get_distance(
+                            current_pos,
+                            (
+                                self.animal_target_cell.x + 0.5,
+                                self.animal_target_cell.y + 0.5,
+                            ),
+                        )
 
                         if target_dist < 15:
                             # continue to animal targeting logic below
