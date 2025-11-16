@@ -4,6 +4,7 @@ import json
 import pathlib
 
 from core.player import Player
+import core.constants as c
 
 from players.group1.player import Player1
 from players.group10.player import Player10
@@ -74,6 +75,9 @@ class MapArgs:
             or not all(isinstance(v, int) for v in ark_pos)
         ):
             raise TypeError("'ark_position' must be an X,Y pair")
+
+        if not (0 <= ark_pos[0] < c.X and 0 <= ark_pos[1] < c.Y):
+            raise ValueError(f"'ark_position' coordinate must be between 0 and {c.Y}")
         ark = (ark_pos[0], ark_pos[1])
 
         return MapArgs(num_helpers, animals, ark)

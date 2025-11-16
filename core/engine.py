@@ -7,6 +7,7 @@ from core.ark import Ark
 from core.message import Message
 from core.player import Player
 from core.cell import Cell
+from core.player_info import PlayerInfo
 from core.sight import Sight
 from core.snapshots import HelperSurroundingsSnapshot
 from core.timer import Timer
@@ -21,6 +22,7 @@ class Engine:
         grid: list[list[Cell]],
         ark: Ark,
         helpers: list[Player],
+        info_helpers: dict[PlayerInfo, Player],
         time: int,
         animals: dict[Animal, Cell],
         species_stats: dict[int, list[int]],
@@ -28,8 +30,9 @@ class Engine:
         self.grid = grid
         self.ark = ark
         self.helpers = helpers
+        self.info_helpers = info_helpers
         self.time = time
-        self.free_animals = animals
+        self.animals: dict[Animal, Cell | PlayerInfo] = dict(animals)
         self.species_stats = species_stats
         self.time_elapsed = 0
         self.last_messages: dict[int, int | None] = {h.id: None for h in self.helpers}
@@ -37,15 +40,19 @@ class Engine:
         # record the time used for each turn
         self.times = []
 
-    def _get_sights(self) -> dict[Player, list[Player]]:
-        in_sight: dict[Player, list[Player]] = {helper: [] for helper in self.helpers}
+    def _get_sights(self) -> dict[PlayerInfo, list[PlayerInfo]]:
+        info_helpers = list(self.info_helpers.keys())
+        in_sight: dict[PlayerInfo, list[PlayerInfo]] = {
+            helper: [] for helper in info_helpers
+        }
 
-        for i, helper in enumerate(self.helpers):
-            for j in range(i + 1, len(self.helpers)):
-                neighbor = self.helpers[j]
-                if helper.distance(neighbor) <= c.MAX_SIGHT_KM:
-                    in_sight[helper].append(neighbor)
-                    in_sight[neighbor].append(helper)
+        for i in range(len(info_helpers)):
+            for j in range(i + 1, len(info_helpers)):
+                hi, hj = info_helpers[i], info_helpers[j]
+
+                if hi.distance(hj) <= c.MAX_SIGHT_KM:
+                    in_sight[hi].append(hj)
+                    in_sight[hj].append(hi)
 
         return in_sight
 
@@ -53,8 +60,6 @@ class Engine:
         return self.time_elapsed >= self.time - c.START_RAIN
 
     def run_turn(self) -> float:
-        is_raining = self.is_raining()
-        ark_view = self.ark.get_view()
         self.last_messages.clear()
 
         # 1. show helpers their new surroundings:
@@ -68,25 +73,26 @@ class Engine:
         # 2. get helpers' one byte message:
 
         sights = self._get_sights()
-        messages_to: dict[Player, list[Message]] = {
-            helper: [] for helper in self.helpers
+        messages_to: dict[PlayerInfo, list[Message]] = {
+            helper: [] for helper in self.info_helpers.keys()
         }
 
         # Tracks the total time consumed by the player
         timer = Timer()
 
-        for helper in self.helpers:
-            sight = Sight(helper.position, self.grid)
+        for hi, helper in self.info_helpers.items():
+            sight = Sight((hi.x, hi.y), self.grid)
 
             helper_ark_view = None
-            if helper.is_in_ark():
-                helper_ark_view = ark_view
+            if hi.is_in_ark():
+                helper_ark_view = self.ark.get_view()
 
             snapshot = HelperSurroundingsSnapshot(
                 self.time_elapsed,
-                is_raining,
-                helper.position,
+                self.is_raining(),
+                (hi.x, hi.y),
                 sight,
+                hi.flock.copy(),
                 helper_ark_view,
                 timer.copy(),
             )
@@ -96,14 +102,14 @@ class Engine:
 
             if not (0 <= one_byte_message < c.ONE_BYTE):
                 raise Exception(
-                    f"helper {helper.id} gave incorrect message: {one_byte_message}"
+                    f"helper {hi.id} gave incorrect message: {one_byte_message}"
                 )
 
-            self.last_messages[helper.id] = one_byte_message
+            self.last_messages[hi.id] = one_byte_message
 
             # broadcast message to all neighbors
-            for neighbor in sights[helper]:
-                msg = Message(helper.get_view(), one_byte_message)
+            for neighbor in sights[hi]:
+                msg = Message(hi.get_view(), one_byte_message)
                 messages_to[neighbor].append(msg)
 
         # 3. broadcast helpers' one byte message to all other helpers in their sight.
@@ -112,57 +118,78 @@ class Engine:
         # a obtain and/or release animals in their sight
         # b move in any direction
 
-        obtained: dict[Animal, list[Player]] = {}
-        for helper in self.helpers:
+        obtained: dict[Animal, list[PlayerInfo]] = {}
+        for hi, helper in self.info_helpers.items():
             last = perf_counter()
-            action = helper.get_action(messages_to[helper])
+            action = helper.get_action(messages_to[hi])
             timer.consumed += perf_counter() - last
 
-            if helper.kind == Kind.Noah and action is not None:
+            if hi.kind == Kind.Noah and action is not None:
                 raise Exception("Noah shouldn't perform an action")
 
             match action:
                 case Release(animal=a):
-                    helper_x, helper_y = tuple(map(int, helper.position))
+                    helper_x, helper_y = int(hi.x), int(hi.y)
                     cell = self.grid[helper_y][helper_x]
 
-                    if a not in helper.flock:
-                        raise Exception(f"animal {a} not in helper {helper.id}'s flock")
+                    if a not in hi.flock:
+                        raise Exception(f"animal {a} not in helper {hi.id}'s flock")
 
-                    helper.flock.remove(a)
-                    self.free_animals[a] = cell
+                    hi.flock.remove(a)
+                    self.animals[a] = cell
                     cell.animals.add(a)
 
                 case Obtain(animal=a):
-                    helper_x, helper_y = tuple(map(int, helper.position))
+                    helper_x, helper_y = int(hi.x), int(hi.y)
                     helper_cell = self.grid[helper_y][helper_x]
 
-                    if len(helper.flock) >= c.MAX_FLOCK_SIZE:
+                    if len(hi.flock) >= c.MAX_FLOCK_SIZE:
                         raise Exception(
-                            f"helper {helper.id} tried to obtain animal with full flock"
+                            f"helper {hi.id} tried to obtain animal with full flock"
                         )
 
-                    if a not in helper_cell.animals:
-                        raise Exception(
-                            f"animal {a}, (hash={a.__hash__()}, id={id(a)}) not in helper {helper.id}'s cell {(helper_x, helper_y)}"
-                        )
+                    placed = self.animals[a]
 
-                    if a not in obtained:
-                        obtained[a] = []
-                    obtained[a].append(helper)
+                    match placed:
+                        case Cell() as cell:
+                            if cell != helper_cell or a not in helper_cell.animals:
+                                raise Exception(
+                                    f"animal {a}, (id={id(a)}) not in helper {hi.id}'s cell {(helper_x, helper_y)}"
+                                )
+
+                            if a not in obtained:
+                                obtained[a] = []
+                            obtained[a].append(hi)
+
+                        case PlayerInfo():
+                            # raise Exception(
+                            #     f"{hi.get_long_name()} tried obtaining an animal already obtained by {playerinfo.get_long_name()}"
+                            # )
+                            pass
 
                 case Move(x=x, y=y):
-                    if not helper.can_move_to(x, y):
+                    if not hi.can_move_to(x, y):
                         raise Exception(
-                            f"player cannot move from {helper.position} to {(x, y)}"
+                            f"player cannot move from {hi.x, hi.y} to {(x, y)}"
                         )
 
-                    helper.position = (x, y)
+                    x_cell, y_cell = int(x), int(y)
+                    target_cell = self.grid[y_cell][x_cell]
+
+                    x_curr_cell, y_curr_cell = int(hi.x), int(hi.y)
+                    curr_cell = self.grid[y_curr_cell][x_curr_cell]
+
+                    if (x_cell, y_cell) != (x_curr_cell, y_curr_cell):
+                        curr_cell.helpers.remove(hi)
+                        target_cell.helpers.add(hi)
+
+                    hi.x = x
+                    hi.y = y
 
                     # offload helper's flock to ark
-                    if helper.is_in_ark():
-                        self.ark.animals = self.ark.animals.union(helper.flock)
-                        helper.flock.clear()
+                    if hi.is_in_ark():
+                        self.ark.animals = self.ark.animals.union(hi.flock)
+                        hi.flock.clear()
 
         # multiple helpers may try to obtain same animal
         # Only one may actually obtain it.
@@ -171,23 +198,25 @@ class Engine:
         # 2. helper with min id
         for obt_animal, helpers in obtained.items():
             best_helper = min(helpers, key=lambda h: (len(h.flock), h.id))
-            helper_x, helper_y = tuple(map(int, best_helper.position))
+            helper_x, helper_y = int(best_helper.x), int(best_helper.y)
             helper_cell = self.grid[helper_y][helper_x]
 
             helper_cell.animals.remove(obt_animal)
-            del self.free_animals[obt_animal]
+            self.animals[obt_animal] = best_helper
             best_helper.flock.add(obt_animal)
 
         # 5. let free animals move with `ANIMAL_MOVE_PROBABILITY` probability
-        for animal, cell in self.free_animals.items():
-            if random() < c.ANIMAL_MOVE_PROBABILITY:
-                neighbor = choice(cell.get_emptiest_neighbors())
+        for animal, placed in self.animals.items():
+            match placed:
+                case Cell() as cell:
+                    if random() < c.ANIMAL_MOVE_PROBABILITY:
+                        neighbor = choice(cell.get_emptiest_neighbors())
 
-                cell.animals.remove(animal)
-                neighbor.animals.add(animal)
-                # modifying self.free_animals while iterating
-                # is ok as we're not changing the keys
-                self.free_animals[animal] = neighbor
+                        cell.animals.remove(animal)
+                        neighbor.animals.add(animal)
+                        # modifying self.animals while iterating
+                        # is ok as we're not changing the keys
+                        self.animals[animal] = neighbor
 
         self.time_elapsed += 1
         self.times.append(timer.consumed)
@@ -195,7 +224,7 @@ class Engine:
 
     def get_results(self) -> tuple[int, list[float]]:
         # By the end, all helpers must be in the ark
-        if not all([helper.is_in_ark() for helper in self.helpers]):
+        if not all([hi.is_in_ark() for hi in self.info_helpers.keys()]):
             return 0, []
 
         return self.ark.get_score(), self.times

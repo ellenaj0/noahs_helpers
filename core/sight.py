@@ -1,4 +1,5 @@
-from typing import Iterator
+from typing import Iterator, SupportsIndex
+import operator
 
 from core.cell import Cell, CellView
 
@@ -40,7 +41,10 @@ class Sight:
                         x, y, self.helper_x_int, self.helper_y_int, grid
                     )
 
-    def cell_is_in_sight(self, x: int, y: int) -> bool:
+    def cell_is_in_sight(self, x: SupportsIndex, y: SupportsIndex) -> bool:
+        x = operator.index(x)
+        y = operator.index(y)
+
         if not (self.west <= x <= self.east and self.north <= y <= self.south):
             return False
 

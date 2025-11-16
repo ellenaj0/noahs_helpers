@@ -19,7 +19,7 @@ class RandomPlayer(Player):
         ark_x: int,
         ark_y: int,
         kind: Kind,
-        num_helpers,
+        num_helpers: int,
         species_populations: dict[str, int],
     ):
         super().__init__(id, ark_x, ark_y, kind, num_helpers, species_populations)
@@ -58,13 +58,18 @@ class RandomPlayer(Player):
 
         return old_x + dx, old_y + dy
 
-    def check_surroundings(self, snapshot: HelperSurroundingsSnapshot):
+    def check_surroundings(self, snapshot: HelperSurroundingsSnapshot) -> int:
+        # I can't trust that my internal position and flock matches the simulators
+        # For example, I wanted to move in a way that I couldn't
+        # or the animal I wanted to obtain was actually obtained by another helper
         self.position = snapshot.position
+        self.flock = snapshot.flock
+
         self.sight = snapshot.sight
         self.is_raining = snapshot.is_raining
 
         # if I didn't receive any messages, broadcast "hello"
-        # a "hello" message is the
+        # a "hello" message is when a player's id bit is set
         if len(self.hellos_received) == 0:
             msg = 1 << (self.id % 8)
         else:
@@ -97,15 +102,19 @@ class RandomPlayer(Player):
         if not self.is_flock_empty():
             return Move(*self.move_towards(*self.ark_position))
 
-        # If I've chased an animal, I'll obtain it
+        # If I've reached an animal, I'll obtain it
         cellview = self._get_my_cell()
         if len(cellview.animals) > 0:
+            # This means the random_player will even attempt to
+            # (unsuccessfully) obtain animals in other helpers' flocks
             random_animal = choice(tuple(cellview.animals))
             return Obtain(random_animal)
 
         # If I see any animals, I'll chase the closest one
         closest_animal = self._find_closest_animal()
         if closest_animal:
+            # This means the random_player will even approach
+            # animals in other helpers' flocks
             return Move(*self.move_towards(*closest_animal))
 
         # Move in a random direction

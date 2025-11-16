@@ -82,9 +82,20 @@ class ArkRunner:
             )
             for id in range(self.num_helpers)
         ]
+        info_helpers = {h.get_info(): h for h in self.helpers}
+
+        for hi, helper in info_helpers.items():
+            x_cell, y_cell = tuple(map(int, helper.position))
+            self.grid[y_cell][x_cell].helpers.add(hi)
 
         engine = Engine(
-            self.grid, self.ark, self.helpers, self.time, animals, species_stats
+            self.grid,
+            self.ark,
+            self.helpers,
+            info_helpers,
+            self.time,
+            animals,
+            species_stats,
         )
 
         return engine

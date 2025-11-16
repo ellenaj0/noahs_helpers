@@ -4,8 +4,9 @@ from collections import deque
 
 from core.animal import Animal, Gender
 from core.ark import Ark
+from core.cell import Cell
 from core.engine import Engine
-from core.player import Player
+from core.player_info import PlayerInfo
 from core.ui.utils import render_img, write_at
 from core.views.player_view import Kind
 
@@ -45,7 +46,7 @@ class ArkUI:
         self.debug_mode = False
 
         self.drawn_objects: dict[
-            tuple[tuple[float, float], float], Ark | Player | Animal
+            tuple[tuple[float, float], float], Ark | PlayerInfo | Animal
         ] = {}
 
         self.drawn_cells: dict[tuple[tuple[int, int], int], tuple[int, int]] = {}
@@ -298,25 +299,22 @@ class ArkUI:
                 y += 50
 
     def draw_helpers_on_map(self):
-        for helper in self.engine.helpers:
-            helper_x, helper_y = helper.position
-
-            helper_center = self.map_coords_to_px(helper_x, helper_y)
-            helper.draw_on_map(self.screen, helper_center)
+        for hi in self.engine.info_helpers.keys():
+            helper_center = self.map_coords_to_px(hi.x, hi.y)
+            hi.draw_on_map(self.screen, helper_center)
 
     def draw_helpers(self):
-        for helper in self.engine.helpers:
-            helper_x, helper_y = helper.position
-            if not self.coords_fit_in_grid(helper_x, helper_y):
+        for hi in self.engine.info_helpers.keys():
+            if not self.coords_fit_in_grid(hi.x, hi.y):
                 continue
 
-            helper_center = self.coords_to_px(helper_x, helper_y)
+            helper_center = self.coords_to_px(hi.x, hi.y)
 
-            helper.draw(self.screen, self.big_font, helper_center)
-            self.drawn_objects[(helper_center, c.HELPER_RADIUS)] = helper
+            hi.draw(self.screen, self.big_font, helper_center)
+            self.drawn_objects[(helper_center, c.HELPER_RADIUS)] = hi
 
-    def draw_hovered_helper(self, helper: Player):
-        left, top = self.render_hover_view(helper.get_long_name())
+    def draw_hovered_helper(self, hi: PlayerInfo):
+        left, top = self.render_hover_view(hi.get_long_name())
 
         y = top + c.MARGIN_Y
 
@@ -324,13 +322,13 @@ class ArkUI:
         write_at(
             self.screen,
             self.small_font,
-            f"pos: ({helper.position[0]:.2f}, {helper.position[1]:.2f})",
+            f"pos: ({hi.x:.2f}, {hi.y:.2f})",
             (margined_x, y),
             align="left",
         )
 
         # noah doesn't have a flock
-        if helper.kind != Kind.Noah:
+        if hi.kind != Kind.Noah:
             y += c.MARGIN_Y
             write_at(
                 self.screen,
@@ -340,27 +338,29 @@ class ArkUI:
                 align="left",
             )
             y += 30
-            helper.draw_flock(self.screen, self.big_font, (margined_x + 20, y))
+            hi.draw_flock(self.screen, self.big_font, (margined_x + 20, y))
 
         y += c.MARGIN_Y
 
-        last_msg = self.engine.last_messages[helper.id]
+        last_msg = self.engine.last_messages[hi.id]
         if last_msg:
-            helper.draw_message(self.screen, self.big_font, (margined_x, y), last_msg)
+            hi.draw_message(self.screen, self.big_font, (margined_x, y), last_msg)
 
     def draw_animals_on_map(self):
-        for animal, cell in self.engine.free_animals.items():
+        for animal, cell in self.engine.animals.items():
             animal_center = self.map_coords_to_px(cell.x, cell.y)
             animal.draw_on_map(self.screen, animal_center)
 
     def draw_animals(self):
-        for animal, cell in self.engine.free_animals.items():
-            if not self.coords_fit_in_grid(cell.x, cell.y):
-                continue
-            animal_center = self.coords_to_px(cell.x, cell.y)
+        for animal, placed in self.engine.animals.items():
+            match placed:
+                case Cell() as cell:
+                    if not self.coords_fit_in_grid(cell.x, cell.y):
+                        continue
+                    animal_center = self.coords_to_px(cell.x, cell.y)
 
-            animal.draw(self.screen, self.big_font, animal_center)
-            self.drawn_objects[(animal_center, c.ANIMAL_RADIUS)] = animal
+                    animal.draw(self.screen, self.big_font, animal_center)
+                    self.drawn_objects[(animal_center, c.ANIMAL_RADIUS)] = animal
 
     def draw_hovered_animal(self, sid: int, gender: Gender, pos: tuple[int, int]):
         left, top = self.render_hover_view("Animal")
@@ -413,11 +413,14 @@ class ArkUI:
         match best_obj:
             case Ark(position=p):
                 self.draw_hovered_ark(p)
-            case Player() as player:
-                self.draw_hovered_helper(player)
+            case PlayerInfo() as hi:
+                self.draw_hovered_helper(hi)
             case Animal(species_id=sid, gender=g):
-                cell = self.engine.free_animals[best_obj]
-                self.draw_hovered_animal(sid, g, (cell.x, cell.y))
+                placed = self.engine.animals[best_obj]
+
+                match placed:
+                    case Cell() as cell:
+                        self.draw_hovered_animal(sid, g, (cell.x, cell.y))
 
     def draw_objects(self):
         self.drawn_objects.clear()
@@ -456,7 +459,8 @@ class ArkUI:
 
         if self.engine.time_elapsed == self.engine.time:
             org_score = self.engine.ark.get_score()
-            deduct = not all([helper.is_in_ark() for helper in self.engine.helpers])
+
+            deduct = not all([hi.is_in_ark() for hi in self.engine.info_helpers.keys()])
             write_at(
                 self.screen,
                 self.big_font,
@@ -538,12 +542,12 @@ class ArkUI:
         y = 10
         x = 0
 
-        for helper in self.engine.helpers:
-            if helper.kind == Kind.Noah:
+        for hi in self.engine.info_helpers.keys():
+            if hi.kind == Kind.Noah:
                 write_at(
                     helpers_surface,
                     self.big_font,
-                    f"{helper.get_short_name()}: no flock",
+                    f"{hi.get_short_name()}: no flock",
                     (x, y),
                     align="left",
                 )
@@ -551,17 +555,17 @@ class ArkUI:
                 write_at(
                     helpers_surface,
                     self.big_font,
-                    f"{helper.get_short_name()}: ",
+                    f"{hi.get_short_name()}: ",
                     (x, y),
                     align="left",
                 )
-                helper.draw_flock(helpers_surface, self.big_font, (x + 60, y))
+                hi.draw_flock(helpers_surface, self.big_font, (x + 60, y))
 
             incr_y = y + c.INFO_HELPER_HEIGHT // 2
 
-            msg = self.engine.last_messages[helper.id]
+            msg = self.engine.last_messages[hi.id]
             if msg:
-                helper.draw_message(helpers_surface, self.small_font, (x, incr_y), msg)
+                hi.draw_message(helpers_surface, self.small_font, (x, incr_y), msg)
             else:
                 write_at(
                     helpers_surface,
@@ -613,21 +617,21 @@ class ArkUI:
         mask = pygame.Surface((grid.w, grid.h), pygame.SRCALPHA)
         mask.fill((0, 0, 0, 50))
 
-        for helper in self.engine.helpers:
-            if not self.coords_fit_in_grid(*helper.position):
+        for hi in self.engine.info_helpers.keys():
+            if not self.coords_fit_in_grid(hi.x, hi.y):
                 continue
 
-            grid_center = self.coords_to_px(*helper.position)
+            grid_center = self.coords_to_px(hi.x, hi.y)
             center = grid_center[0] - grid.x, grid_center[1] - grid.y
             radius = km_to_px(c.MAX_SIGHT_KM)
 
             pygame.draw.circle(mask, (0, 0, 0, 0), center, radius)
 
-        for helper in self.engine.helpers:
-            if not self.coords_fit_in_grid(*helper.position):
+        for hi in self.engine.info_helpers.keys():
+            if not self.coords_fit_in_grid(hi.x, hi.y):
                 continue
 
-            grid_center = self.coords_to_px(*helper.position)
+            grid_center = self.coords_to_px(hi.x, hi.y)
             center = grid_center[0] - grid.x, grid_center[1] - grid.y
             radius = km_to_px(c.MAX_SIGHT_KM)
 

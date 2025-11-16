@@ -91,6 +91,9 @@ def sanitize_time(org_T: None | int) -> int:
         print(f"generated T={time}")
         return time
 
+    if not (c.MIN_T <= org_T <= c.MAX_T):
+        raise Exception(f"supplied 'T' not between {c.MIN_T} and {c.MAX_T}")
+
     return org_T
 
 
@@ -98,16 +101,20 @@ def sanitize_ark(
     org_ark: None | tuple[str, str], map_args: MapArgs | None
 ) -> tuple[int, int]:
     if org_ark is None and map_args is None:
-        raise Exception("missing `--ark` and `--map-args`")
+        raise Exception("missing `--ark` and `--map_path`")
         # x, y = random.randint(0, c.X - 1), random.randint(0, c.Y - 1)
         # print(f"generated ark pos={x, y}")
         # return x, y
 
     if org_ark is not None and map_args is not None:
-        raise Exception("defined both `--ark` and `--map-args`")
+        raise Exception("defined both `--ark` and `--map_path`")
 
     if org_ark is not None:
-        return int(org_ark[0]), int(org_ark[1])
+        ark_x, ark_y = int(org_ark[0]), int(org_ark[1])
+        if not (0 <= ark_x < c.X and 0 <= ark_y < c.Y):
+            raise Exception(f"supplied ark coordinates not between 0 and {c.X}")
+
+        return ark_x, ark_y
 
     if map_args is not None:
         return map_args.ark
