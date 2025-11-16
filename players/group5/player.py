@@ -205,6 +205,12 @@ class Player5(Player):
             if self.position_is_in_cell(cell_view.x, cell_view.y):
                 continue
 
+            # Avoid targeting cells that are already beyond the 1000-unit
+            # safe radius from the Ark.
+            cell_center = (cell_view.x + 0.5, cell_view.y + 0.5)
+            if self._get_distance(cell_center, self.ark_pos) > 1000.0:
+                continue
+
             if not cell_view.helpers:
                 for animal in cell_view.animals:
                     # Check if EITHER gender is missing for the species
@@ -291,6 +297,12 @@ class Player5(Player):
         current_x, current_y = self.position
         current_pos = (current_x, current_y)
 
+        # Hard safety cap: if we're already beyond the 1000-unit radius from
+        # the Ark, abandon any active targets and return directly toward the Ark.
+        if self._get_distance(current_pos, self.ark_pos) > 1000.0:
+            self.animal_target_cell = None
+            self.current_target_pos = None
+            return self._get_return_move(current_pos, direct=True)
         # --- HIGHEST PRIORITY: RELEASE INTERNAL FLOCK DUPLICATES ---
         flock_keys = [(a.species_id, a.gender) for a in self.flock]
 
@@ -358,15 +370,25 @@ class Player5(Player):
             )
 
             target_cell_center = (target_cell_x + 0.5, target_cell_y + 0.5)
+            # If the chase target lies outside the allowed radius, abandon it
+            # and head back toward the Ark instead.
+            if self._get_distance(target_cell_center, self.ark_pos) > 1000.0:
+                self.animal_target_cell = None
+                self.current_target_pos = None
+                return self._get_return_move(current_pos, direct=False)
+
             return self._get_move_to_target(current_pos, target_cell_center)
 
         # Scan for new animal target
         if len(self.flock) < c.MAX_FLOCK_SIZE:
             new_target_cell = self._find_needed_animal_in_sight()
             if new_target_cell:
-                self.animal_target_cell = new_target_cell
                 target_cell_center = (new_target_cell.x + 0.5, new_target_cell.y + 0.5)
-                return self._get_move_to_target(current_pos, target_cell_center)
+                # Only commit to a chase target that keeps us within 1000 units
+                # of the Ark.
+                if self._get_distance(target_cell_center, self.ark_pos) <= 1000.0:
+                    self.animal_target_cell = new_target_cell
+                    return self._get_move_to_target(current_pos, target_cell_center)
 
         # 2. Movement Phase (Return or Explore)
         if self.is_raining:
@@ -443,4 +465,13 @@ class Player5(Player):
                 return self._get_new_random_target(current_pos)
 
         # Continue movement
+        # If the currently set exploration target would place us outside the
+        # allowed radius, abandon it and head back to the Ark.
+        if (
+            self.current_target_pos is not None
+            and self._get_distance(self.current_target_pos, self.ark_pos) > 1000.0
+        ):
+            self.current_target_pos = None
+            return self._get_return_move(current_pos, direct=False)
+
         return self._get_move_to_target(current_pos, self.current_target_pos)
