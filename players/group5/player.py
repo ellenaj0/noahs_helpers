@@ -59,6 +59,7 @@ class Player5(Player):
         self.is_exploring_fan_out = True
 
         self.ignore_list = []  # List of species_ids where internal duplicates were found
+        self.max_explore_dis = 100  # technically 200 at turn 1
 
     # --- Player5 Helper Methods ---
 
@@ -74,11 +75,9 @@ class Player5(Player):
         for animal in ark_animals:
             if animal.gender != Gender.Unknown:
                 ark_set.add((animal.species_id, animal.gender))
-
-                # sorted_ark_list = sorted(list(ark_set), key=lambda x: x[0])
-                # 2. Print the sorted list
-                # print(sorted_ark_list)
-                # print("------")
+                self.is_exploring_fan_out = True
+                self.base_angle += random()
+                self.base_angle = self.base_angle % (2 * math.pi)
 
         self.ignore_list.clear()  # Clear ignore list upon full Ark sync
         self.obtained_species.update(ark_set)
@@ -124,7 +123,7 @@ class Player5(Player):
         prev_dx = current_x - prev_x
         prev_dy = current_y - prev_y
 
-        max_tries = 20
+        max_tries = 150
         for _ in range(max_tries):
             angle = random() * 2 * math.pi
             target_x = current_x + math.cos(angle) * TARGET_POINT_DISTANCE
@@ -289,6 +288,8 @@ class Player5(Player):
         # --- TURN-BASED ACTION: Clear ignore_list every 250 turns ---
         if self.time_elapsed > 0 and self.time_elapsed % 250 == 0:
             self.ignore_list.clear()
+        if self.time_elapsed % 1000 == 0:
+            self.max_explore_dis += 100
 
         # Noah doesn't act
         if self.kind == Kind.Noah:
@@ -299,10 +300,23 @@ class Player5(Player):
 
         # Hard safety cap: if we're already beyond the 1000-unit radius from
         # the Ark, abandon any active targets and return directly toward the Ark.
+        # If it is raining, must return immediately and DIRECTLY if cutting it close
         if self._get_distance(current_pos, self.ark_pos) > 1000.0:
             self.animal_target_cell = None
             self.current_target_pos = None
             return self._get_return_move(current_pos, direct=True)
+        if self.is_raining:
+            turns_remaining = self._get_turns_remaining_until_end()
+            turns_needed = self._get_turns_to_reach_ark()
+
+            if turns_remaining is not None:
+                time_buffer = turns_remaining - turns_needed
+                distance_to_ark = self._get_distance(current_pos, self.ark_pos)
+
+                # must return immediately and DIRECTLY if cutting it close
+                if time_buffer < 3:
+                    return self._get_return_move(current_pos, direct=True)
+
         # --- HIGHEST PRIORITY: RELEASE INTERNAL FLOCK DUPLICATES ---
         flock_keys = [(a.species_id, a.gender) for a in self.flock]
 
@@ -320,23 +334,10 @@ class Player5(Player):
             self.animal_target_cell = None
             return Release(animal=duplicate_to_release)
 
-        # --- SECOND HIGHEST PRIORITY: RELEASE DUPLICATES ALREADY ON ARK ---
-        for animal in list(self.flock):
-            species_id = animal.species_id
-            '''
-            male_obtained = (species_id, Gender.Male) in self.obtained_species
-            female_obtained = (species_id, Gender.Female) in self.obtained_species
-
-            if male_obtained and female_obtained:
-                # Release if both genders are saved on the Ark
-                self.animal_target_cell = None
-                print(self.id)
-                print("2")
-                print("----")
-                return Release(animal=animal)'''
-
         # --- NEXT PRIORITY: IMMEDIATE OBTAIN IN CURRENT CELL ---
-        if len(self.flock) < c.MAX_FLOCK_SIZE:
+        if len(self.flock) >= c.MAX_FLOCK_SIZE:
+            return self._get_return_move(current_pos, direct=True)
+        else:
             current_cell_x, current_cell_y = int(current_x), int(current_y)
 
             try:
@@ -402,10 +403,6 @@ class Player5(Player):
                 time_buffer = turns_remaining - turns_needed
                 distance_to_ark = self._get_distance(current_pos, self.ark_pos)
 
-                # must return immediately and DIRECTLY if cutting it close
-                if time_buffer < 50:
-                    return self._get_return_move(current_pos, direct=True)
-
                 if distance_to_ark < 200 and time_buffer > 200:
                     # if flock is full, drop them off and go back out
                     if len(self.flock) >= 3:
@@ -458,7 +455,9 @@ class Player5(Player):
                         MIN_MAP_COORD <= new_x <= MAX_MAP_COORD
                         and MIN_MAP_COORD <= new_y <= MAX_MAP_COORD
                     )
-                ) or self._get_distance((new_x, new_y), self.ark_pos) > 1000.0:
+                ) or self._get_distance(
+                    (new_x, new_y), self.ark_pos
+                ) > self.max_explore_dis:
                     self.is_exploring_fan_out = False
                     return self._get_new_random_target(current_pos)
 
