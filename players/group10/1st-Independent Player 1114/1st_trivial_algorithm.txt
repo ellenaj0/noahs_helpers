@@ -1,0 +1,117 @@
+INDEPENDENT PLAYER ALGORITHM – RADIAL EXPLORATION WITH DYNAMIC TRACKING
+
+1. INITIALIZATION AND SECTOR ASSIGNMENT
+There are n helpers in total. Divide the 360-degree space around the Ark evenly so each helper is responsible for a sector of size 360/n degrees.
+Helper i starts with heading angle = i × (360/n).
+All helpers start at the Ark at position (XA, YA) and share knowledge of which species and genders are already loaded on the Ark.
+
+2. OUTBOUND EXPLORATION
+Each helper moves straight along its assigned heading at maximum speed (1 km/turn).
+
+When a helper sees animals within sight range (5 km):
+- Identifies needed animals: species where Ark doesn't have both genders yet
+- Records target species ID and starts HUNTING state
+- Saves current position as "discovery position" to return to later
+
+3. DYNAMIC ANIMAL TRACKING (HUNTING STATE)
+Animals move with 50% probability each turn, so helpers must track them dynamically:
+- Each turn, search sight for animals of target species ID
+- Update target cell position to current animal location
+- Move towards updated position (not fixed location)
+- Attempt to obtain animal when entering same cell
+- If animal obtained: transition to RETURNING_TO_DISCOVERY state
+- If animal lost from sight: give up hunt and resume previous state
+
+Anti-loop protection:
+- Record hunt location and time
+- Don't re-hunt within 10 cells of last hunt for 20 turns
+- Prevents getting stuck chasing unavailable animals
+
+4. RETURN TO DISCOVERY POSITION
+After catching an animal during exploration or return:
+- Navigate back to "discovery position" (where hunt started)
+- Upon arrival:
+  - If have any animals: transition to RETURNING state
+  - If no animals: resume previous state (exploring or returning)
+- Immediately continue to avoid re-hunting same location
+
+5. OPPORTUNISTIC HUNTING DURING RETURN
+On the return path to Ark, helper continues hunting:
+- Scans sight for needed animals
+- Starts new hunt if space available in flock (< 4 animals)
+- Catches animals until flock is full or near Ark
+- Each catch triggers return to discovery position, then resumes return
+
+This maximizes animals delivered per trip.
+
+6. RETURNING TO THE ARK
+A helper returns to the Ark when:
+- Captured any animals (to deliver them), OR
+- Flock becomes full (4 animals), OR
+- Time constraint requires immediate return
+
+The helper moves in straight line toward Ark.
+Upon arrival:
+- All animals automatically unload
+- Ark updates shared species/gender list
+- Helper sees updated list for next exploration
+
+7. DIRECTION SELECTION FOR NEXT EXPLORATION
+Helper chooses next angle to maximize coverage within its sector:
+
+Algorithm:
+- Generate 72 candidate angles uniformly within sector
+- For each candidate, calculate minimum distance to ALL obstacles:
+  * Previously explored angles
+  * Sector start boundary (e.g., 0° for Helper 0)
+  * Sector end boundary (e.g., 90° for Helper 0)
+- Select candidate with MAXIMUM minimum distance
+
+Examples:
+- Sector 0-90°, explored [0°] → choose 45° (far from 0°, 90°)
+- Sector 0-90°, explored [0°, 45°] → choose 67.5° or 22.5°
+- Ensures balanced radial coverage avoiding boundaries
+
+8. TIME AND DISTANCE CONSTRAINTS
+Safety calculations performed every turn:
+- Track rain start time (occurs at turn T - 1008)
+- Calculate turns needed to return: ceil(distance_to_ark / 1.0 km)
+- Available turns: time_remaining - 100 (safety margin)
+- Force return if: available_turns ≤ 100 OR turns_to_return + 100 > available_turns
+
+Never explore beyond safe return distance.
+All helpers must be at Ark when simulation ends at turn T.
+
+9. ANIMAL SELECTION CRITERIA
+When deciding which animals to hunt:
+
+PRIORITY 1 - Known Gender (in same cell):
+- Gender visible, Ark needs this species+gender
+- Highest priority, always pursue
+
+PRIORITY 2 - Unknown Gender (distant):
+- Gender not yet visible (distance > 0)
+- Species incomplete (Ark missing at least one gender)
+- Time remaining > 200 turns
+- May be shepherded by another helper, but worth checking
+
+SKIP:
+- Animals already in helper's flock
+- Animals in same cell but gender still Unknown (likely shepherded)
+- Species where Ark has both genders
+- Unknown gender animals when time < 200 turns (focus on returning)
+
+10. STATE MACHINE
+States: at_ark → exploring → hunting → returning_to_discovery → returning → at_ark
+
+Transitions:
+- at_ark → exploring: after unloading, new direction chosen
+- exploring → hunting: spot needed animal
+- hunting → returning_to_discovery: catch animal
+- returning_to_discovery → returning: have animals, reached discovery position
+- returning_to_discovery → exploring: no animals, reached discovery position
+- returning → hunting: spot needed animal during return (if space available)
+- returning → at_ark: reached ark position
+- any → returning: time constraint forces immediate return
+
+END OF ALGORITHM DESCRIPTION

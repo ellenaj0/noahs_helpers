@@ -12,7 +12,7 @@ def distance(x1: float, y1: float, x2: float, y2: float) -> float:
     return (abs(x1 - x2) ** 2 + abs(y1 - y2) ** 2) ** 0.5
 
 
-class Player2(Player):
+class SearchAndRescue(Player):
     def __init__(
         self,
         id: int,
@@ -31,8 +31,6 @@ class Player2(Player):
         self.direction = (0, 0)
         self.internal_ark = set()
         self.countdown = 0
-        self.rain = False
-        self.timer = 1008
 
     def _get_my_cell(self) -> CellView:
         xcell, ycell = tuple(map(int, self.position))
@@ -110,7 +108,6 @@ class Player2(Player):
         return msg
 
     def get_action(self, messages: list[Message]) -> Action | None:
-        # print(self.mode)
         # print(self.internal_ark)
         for msg in messages:
             if 1 << (msg.from_helper.id % 8) == msg.contents:
@@ -120,35 +117,14 @@ class Player2(Player):
         if self.kind == Kind.Noah:
             return None
 
-        # Get your ass back to the ark now
-        if self.mode == "get_back":
+        # If it's raining, go to ark
+        if self.is_raining:
             return Move(*self.move_towards(*self.ark_position))
-
-        """If it's raining, keep searching. However, if you are too close to 
-        the deadline, set mode to get_back to immediatly travel to the arc"""
-        if self.rain:
-            self.timer -= 1
-            if (
-                self.timer
-                - distance(
-                    self.position[0],
-                    self.position[1],
-                    self.ark_position[0],
-                    self.ark_position[1],
-                )
-                <= 10
-            ):
-                self.mode = "get_back"
-
-        if self.is_raining and not self.rain:
-            self.rain = True
 
         # If I have obtained an animal, go to ark
         if not self.is_flock_empty():
             return Move(*self.move_towards(*self.ark_position))
 
-        """If a helper checked and animal and noted it is already in the arc
-        we use this function to force a 10 move walk"""
         if self.mode == "move_away":
             if self.countdown <= 0:
                 self.mode = "waiting"
@@ -165,14 +141,13 @@ class Player2(Player):
                     # # (unsuccessfully) obtain animals in other helpers' flocks
                     # random_animal = choice(tuple(cellview.animals))
                     return Obtain(animal)
-            # direction = self._get_random_location()
+            direction = self._get_random_location()
             self.mode = "move_away"
-            # self.direction = direction
+            self.direction = direction
             self.countdown = 10
             return Move(*self.move_towards(*self.direction))
 
-        """If I see any animals that might not be in the arc, I'll chase the 
-        closest one"""
+        # If I see any animals, I'll chase the closest one
         closest_animal = self._find_closest_animal()
         if closest_animal:
             # This means the random_player will even approach
