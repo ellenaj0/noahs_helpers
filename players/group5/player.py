@@ -42,9 +42,9 @@ class Player5(Player):
         # Explicitly save properties
         self.species_stats = species_populations
         self.num_helpers = num_helpers
-        
+
         # --- CRITICAL FIX: Initialize species map defensively ---
-        if not hasattr(self, 'id_to_species'):
+        if not hasattr(self, "id_to_species"):
             sorted_names = sorted(self.species_stats.keys())
             self.id_to_species: Dict[int, str] = {
                 i: name for i, name in enumerate(sorted_names)
@@ -78,11 +78,11 @@ class Player5(Player):
         # --- Specialization Logic Initialization ---
         self.is_specialized = True
         # Specialization limit is now a Group ID (1000, 2000, etc.), not a population count.
-        self.specialization_limit = 0 
+        self.specialization_limit = 0
         # NEW: List of species names this helper focuses on (populated by _assign_specialization)
         self.specialization_target_species: List[str] = []
         # List of (Species ID, Gender) tuples this helper focuses on (max 6)
-        self.to_search_list: List[SpeciesGender] = [] 
+        self.to_search_list: List[SpeciesGender] = []
 
         self._assign_specialization()
 
@@ -100,16 +100,17 @@ class Player5(Player):
             self.is_specialized = False
             self.specialization_limit = 0
             # Initialize target species list for safety
-            self.specialization_target_species = [] 
+            self.specialization_target_species = []
             return
 
         # --- 2. Calculate Total Population and Species List (Rarest First) ---
 
         # Get a list of (species_name, count) tuples and sort by count (rarest first)
         # Filter out species below the minimum gender/species count of 6
-        species_list = sorted([
-            (name, count) for name, count in self.species_stats.items() if count >= 6
-        ], key=itemgetter(1))
+        species_list = sorted(
+            [(name, count) for name, count in self.species_stats.items() if count >= 6],
+            key=itemgetter(1),
+        )
 
         # Calculate total population of all species that meet the min count (>= 6)
         total_population = sum(count for _, count in species_list)
@@ -124,18 +125,18 @@ class Player5(Player):
 
         # specializations_map will store: {specialization_limit_ID: [list_of_species_names]}
         specializations_map: Dict[int, List[str]] = {}
-        
+
         # Define the percentage-based *population targets* for the specialization groups
-        population_percentages = [0.25, 0.10, 0.05, 0.02] #IMPORTANT
+        population_percentages = [0.25, 0.10, 0.05, 0.02]  # IMPORTANT
         # Unique IDs for the groups (used as the new specialization_limit)
-        specialization_limits = [1000, 2000, 3000, 4000]  #placeholder
+        specialization_limits = [1000, 2000, 3000, 4000]  # placeholder
 
         # Iterate through the defined rarity levels from largest (20%) to smallest (2%)
         for i, percent in enumerate(population_percentages):
             target_population = total_population * percent
             current_cumulative_population = 0
             target_species_names = []
-            
+
             # Iterate through the species from rarest to most common
             for species_name, count in species_list:
                 # Add species until the target population is met or exceeded
@@ -144,27 +145,26 @@ class Player5(Player):
                     current_cumulative_population += count
                 else:
                     break
-            
+
             # Assign the list of species to the specialization map
             limit_id = specialization_limits[i]
             specializations_map[limit_id] = target_species_names
-            
 
         # --- 4. Assign Helper Specialization (Helper Distribution) ---
 
         num_specialized_helpers = self.num_helpers - 2
-        group_id = self.id - 2 # The ID for group assignment starts at 1
-        
-        # Helper Distribution (20%, 20%, 20%, 40%) 
+        group_id = self.id - 2  # The ID for group assignment starts at 1
+
+        # Helper Distribution (20%, 20%, 20%, 40%)
         group_percentages = [0.20, 0.20, 0.20, 0.40]
-        
+
         # Calculate group sizes in terms of helper count
         group_sizes = []
         current_cumulative_size = 0
-        
+
         for i in range(len(group_percentages)):
             size = math.ceil(num_specialized_helpers * group_percentages[i])
-            
+
             # Adjust the last group size for rounding errors
             if i == len(group_percentages) - 1:
                 size = max(0, num_specialized_helpers - current_cumulative_size)
@@ -175,16 +175,16 @@ class Player5(Player):
         # Determine which helper group the current helper_id belongs to
         cumulative_helper_count = 0
         assigned_limit = None
-        
+
         # The index 'i' maps the helper group to the rarity group (0->1000, 1->2000, etc.)
         for i, size in enumerate(group_sizes):
             start_id = cumulative_helper_count + 1
             end_id = cumulative_helper_count + size
-            
+
             if start_id <= group_id <= end_id:
                 assigned_limit = specialization_limits[i]
                 break
-                
+
             cumulative_helper_count += size
 
         # Apply the specialization
@@ -192,31 +192,35 @@ class Player5(Player):
             self.is_specialized = True
             self.specialization_limit = assigned_limit
             # Store the target list of species names
-            self.specialization_target_species = specializations_map.get(assigned_limit, [])
+            self.specialization_target_species = specializations_map.get(
+                assigned_limit, []
+            )
         else:
             self.is_specialized = False
             self.specialization_limit = 0
-            self.specialization_target_species = [] # Ensure it's cleared
+            self.specialization_target_species = []  # Ensure it's cleared
 
         # --- 5. Update Target Priority List ---
         # This call now uses the new self.specialization_target_species
         self._update_to_search_list()
-        
+
     def _update_to_search_list(self):
         """
         Recalculates the self.to_search_list by prioritizing the needed animals
         within the helper's assigned specialization list (self.specialization_target_species).
-        
+
         This method is fixed to use the pre-calculated species list instead of the old population limit.
         """
         final_search_list: List[SpeciesGender] = []
 
         # --- Specialized Helper Logic ---
-        if self.is_specialized and hasattr(self, 'specialization_target_species') and self.specialization_target_species:
-            
+        if (
+            self.is_specialized
+            and hasattr(self, "specialization_target_species")
+            and self.specialization_target_species
+        ):
             # The specialization_target_species is already sorted by rarity (rarest first)
             for species_name in self.specialization_target_species:
-
                 species_id = self.species_to_id.get(species_name)
                 if species_id is None:
                     continue
@@ -225,34 +229,38 @@ class Player5(Player):
                 male_needed = (species_id, Gender.Male) not in self.obtained_species
                 if male_needed:
                     final_search_list.append((species_id, Gender.Male))
-                
+
                 # Check if female is needed
                 female_needed = (species_id, Gender.Female) not in self.obtained_species
                 if female_needed:
                     final_search_list.append((species_id, Gender.Female))
-        
 
         species_info: List[Tuple[int, int]] = []
         for name, count in self.species_stats.items():
             species_id = self.species_to_id[name]
             species_info.append((count, species_id))
-        
-        species_info.sort() # Sort by count (rarest first)
-            
+
+        species_info.sort()  # Sort by count (rarest first)
+
         for count, species_id in species_info:
             if len(final_search_list) >= 6:
                 break
-                
+
             # Check if male is needed
-            if (species_id, Gender.Male) not in self.obtained_species and (species_id, Gender.Male) not in final_search_list:
+            if (species_id, Gender.Male) not in self.obtained_species and (
+                species_id,
+                Gender.Male,
+            ) not in final_search_list:
                 final_search_list.append((species_id, Gender.Male))
-            
+
             # Check if female is needed
-            if (species_id, Gender.Female) not in self.obtained_species and (species_id, Gender.Male) not in final_search_list:
+            if (species_id, Gender.Female) not in self.obtained_species and (
+                species_id,
+                Gender.Male,
+            ) not in final_search_list:
                 final_search_list.append((species_id, Gender.Female))
 
         self.to_search_list = final_search_list
-
 
     # --- Player5 Helper Methods (Existing methods modified) ---
 
@@ -274,43 +282,43 @@ class Player5(Player):
 
         self.ignore_list.clear()  # Clear ignore list upon full Ark sync
         self.obtained_species.update(ark_set)
-        
+
         # --- NEW: Specialization Switch and Target Update ---
         is_returning_after_1000 = self.is_specialized and self.time_elapsed > 1000
-        
+
         if is_returning_after_1000:
-            print(f"Helper {self.id} is switching out of specialization mode after turn {self.time_elapsed}.")
+            print(
+                f"Helper {self.id} is switching out of specialization mode after turn {self.time_elapsed}."
+            )
             self.is_specialized = False
-            self.specialization_limit = 0 # Revert to normal helper logic
-            self.specialization_target_species = [] # Clear specialized list
-            self.to_search_list.clear() # Clear specialized list
+            self.specialization_limit = 0  # Revert to normal helper logic
+            self.specialization_target_species = []  # Clear specialized list
+            self.to_search_list.clear()  # Clear specialized list
 
         # If specialized and the list is depleted (min 6), update it
         if self.is_specialized:
-             print(f"Replenish search list for Player: {self.id} ")
-             self._update_to_search_list()
-             
-        #print(f"Helper {self.id} # targets: {len(self.to_search_list)}") # Debug output if needed
+            print(f"Replenish search list for Player: {self.id} ")
+            self._update_to_search_list()
 
+        # print(f"Helper {self.id} # targets: {len(self.to_search_list)}") # Debug output if needed
 
     def _is_species_needed(self, species_id: int, gender: Gender) -> bool:
         """
         Checks if an animal is needed based on gender AND specialization role.
-        
+
         This method is fixed to use the self.to_search_list directly as the filter.
         """
         if species_id in self.ignore_list:
             return False
-        
+
         # --- Specialization Filter (Uses the pre-filtered to_search_list) ---
         if self.is_specialized:
-            
             # The animal must be on the helper's precise target list.
             if gender != Gender.Unknown:
                 if (species_id, gender) not in self.to_search_list:
                     return False
             else:
-                # If gender is unknown (e.g., viewing from a distance), check if 
+                # If gender is unknown (e.g., viewing from a distance), check if
                 # either required gender for this species ID is in the search list.
                 is_target = any(s_id == species_id for s_id, _ in self.to_search_list)
                 if not is_target:
@@ -320,7 +328,7 @@ class Player5(Player):
         if gender == Gender.Unknown:
             male_obtained = (species_id, Gender.Male) in self.obtained_species
             female_obtained = (species_id, Gender.Female) in self.obtained_species
-            
+
             return not (male_obtained and female_obtained)
         else:
             # Check against the Ark list (self.obtained_species)
@@ -354,7 +362,7 @@ class Player5(Player):
         prev_dx = current_x - prev_x
         prev_dy = current_y - prev_y
 
-        max_tries = 150
+        max_tries = 1000
         for _ in range(max_tries):
             angle = random() * 2 * math.pi
             target_x = current_x + math.cos(angle) * TARGET_POINT_DISTANCE
@@ -430,10 +438,9 @@ class Player5(Player):
 
     def _find_needed_animal_in_sight(self) -> Optional[CellView]:
         """Scans sight for an animal that is NOT shepherded and is still needed."""
-        
+
         # If specialized, prioritize targets on the specialized list
         if self.is_specialized and self.to_search_list:
-            
             # Find the species ID that is highest priority in the to_search_list
             priority_species_id = None
             for species_id, _ in self.to_search_list:
@@ -441,15 +448,19 @@ class Player5(Player):
                 if self._is_species_needed(species_id, Gender.Unknown):
                     priority_species_id = species_id
                     break
-            
+
             if priority_species_id is not None:
                 # Find the cell containing this priority species
                 for cell_view in self.sight:
-                    if not cell_view.helpers and not self.position_is_in_cell(cell_view.x, cell_view.y):
+                    if not cell_view.helpers and not self.position_is_in_cell(
+                        cell_view.x, cell_view.y
+                    ):
                         for animal in cell_view.animals:
                             if animal.species_id == priority_species_id:
                                 # We check _is_species_needed again to ensure it passes all filters
-                                if self._is_species_needed(animal.species_id, Gender.Unknown):
+                                if self._is_species_needed(
+                                    animal.species_id, Gender.Unknown
+                                ):
                                     return cell_view
 
         # If not specialized, or no priority target found, revert to finding ANY needed animal
@@ -539,8 +550,8 @@ class Player5(Player):
         return 0
 
     def get_action(self, messages: list[Message]) -> Action | None:
-        # --- TURN-BASED ACTION: Clear ignore_list every 250 turns ---
-        if self.time_elapsed > 0 and self.time_elapsed % 250 == 0:
+        # --- TURN-BASED ACTION: Clear ignore_list every 50 turns ---
+        if self.time_elapsed > 0 and self.time_elapsed % 50 == 0:
             self.ignore_list.clear()
         if self.time_elapsed % 1000 == 0:
             self.max_explore_dis += 100
@@ -551,11 +562,12 @@ class Player5(Player):
             if self.is_specialized:
                 # The specialization limit is now the ID, not a population count
                 limit_text = f"ID:{self.specialization_limit}"
-                print(f"Helper {self.id} is Specialized (Limit {limit_text}). Targets: {len(self.to_search_list)}")
+                print(
+                    f"Helper {self.id} is Specialized (Limit {limit_text}). Targets: {len(self.to_search_list)}"
+                )
             else:
                 print(f"Helper {self.id} is Normal.")
         # --- END PRINT STATEMENT ---
-
 
         # Noah doesn't act
         if self.kind == Kind.Noah:
@@ -584,7 +596,7 @@ class Player5(Player):
                     return self._get_return_move(current_pos, direct=True)
 
         # --- HIGHEST PRIORITY: RELEASE INTERNAL FLOCK DUPLICATES ---
-        # This handles the immediate release of duplicates *after* they are obtained 
+        # This handles the immediate release of duplicates *after* they are obtained
         # and confirmed in the flock.
         flock_keys = [(a.species_id, a.gender) for a in self.flock]
 
@@ -619,40 +631,40 @@ class Player5(Player):
                 current_cell_view = None
 
             if current_cell_view and current_cell_view.animals:
-                
                 animal_to_obtain = None
-                
+
                 # Iterate through all animals currently in the cell
                 for animal in current_cell_view.animals:
-                    
                     # 1. Skip animals already in the helper's flock
                     if animal in self.flock:
                         continue
-                    
+
                     # 2. BUG FIX: Check if the animal is a duplicate on the Ark or in the current flock
                     # We can only confirm duplication if the gender is known (which it is, once in the cell)
                     if animal.gender != Gender.Unknown:
                         animal_key = (animal.species_id, animal.gender)
-                        
+
                         # Check against Ark (self.obtained_species)
                         # self.obtained_species already includes the flock contents from check_surroundings
-                        is_duplicate_in_ark_or_flock = animal_key in self.obtained_species
+                        is_duplicate_in_ark_or_flock = (
+                            animal_key in self.obtained_species
+                        )
 
                         if is_duplicate_in_ark_or_flock:
                             # If it's a known duplicate (we have this species/gender),
                             # add the species ID to the ignore list to prevent future chases of this species.
                             if animal.species_id not in self.ignore_list:
                                 self.ignore_list.append(animal.species_id)
-                            
+
                             # Skip obtaining this duplicate animal
                             continue
-                            
+
                     # 3. If the animal is needed (passed duplicate check, or gender is unknown/needed)
                     # Use the comprehensive _is_species_needed check (which includes specialization and general Ark need)
                     if self._is_species_needed(animal.species_id, animal.gender):
                         # This is the first needed animal found in the cell. Obtain it.
                         animal_to_obtain = animal
-                        break # Found the target, exit the loop over animals
+                        break  # Found the target, exit the loop over animals
 
                 if animal_to_obtain:
                     self.animal_target_cell = None
@@ -682,7 +694,7 @@ class Player5(Player):
 
         # Scan for new animal target
         if len(self.flock) < c.MAX_FLOCK_SIZE:
-            # _find_needed_animal_in_sight() uses _is_species_needed with Gender.Unknown 
+            # _find_needed_animal_in_sight() uses _is_species_needed with Gender.Unknown
             new_target_cell = self._find_needed_animal_in_sight()
             if new_target_cell:
                 target_cell_center = (new_target_cell.x + 0.5, new_target_cell.y + 0.5)
