@@ -1,5 +1,5 @@
-from random import choice, uniform
-from math import cos, sin, pi, atan2
+from random import choice
+from math import cos, sin, pi, atan2, sqrt
 
 import core.constants as c
 from core.views.player_view import Kind
@@ -7,6 +7,7 @@ from core.views.player_view import Kind
 
 # Sector constants
 MAX_SEARCH_RADIUS = 1000.0
+EXPECTED_ANIMALS_IN_CIRCLE = 20
 SECTOR_INTEGRATION_STEPS = 200
 SECTOR_BINARY_SEARCH_ITERATIONS = 50
 SECTOR_OVERLAP_PERCENT = 0
@@ -33,10 +34,13 @@ class SectorManager:
 
         self._initialize_sector()
 
-    def _max_radius_at_angle(
-        self, angle: float, radius: float = MAX_SEARCH_RADIUS
-    ) -> float:
+        # Cache for sector cells
+        self._sector_cells: list[tuple[int, int]] | None = None
+
+    def _max_radius_at_angle(self, angle: float, radius: float | None = None) -> float:
         """Calculate the maximum radius at a given angle such that the point stays within grid bounds."""
+        if radius is None:
+            radius = MAX_SEARCH_RADIUS
         ark_x, ark_y = self.ark_position
         cos_a = cos(angle)
         sin_a = sin(angle)
@@ -69,9 +73,11 @@ class SectorManager:
         return max(0, max_r)
 
     def _calculate_sector_area(
-        self, start_angle: float, end_angle: float, radius: float = MAX_SEARCH_RADIUS
+        self, start_angle: float, end_angle: float, radius: float | None = None
     ) -> float:
         """Calculate the area of a sector clipped by grid boundaries using numerical integration."""
+        if radius is None:
+            radius = MAX_SEARCH_RADIUS
         if start_angle > end_angle:
             # Sector wraps around 0
             area1 = self._calculate_sector_area(start_angle, 2 * pi, radius)
@@ -99,9 +105,11 @@ class SectorManager:
         return area * dtheta / 3.0
 
     def _calculate_cumulative_area(
-        self, end_angle: float, radius: float = MAX_SEARCH_RADIUS
+        self, end_angle: float, radius: float | None = None
     ) -> float:
         """Calculate cumulative area from angle 0 to end_angle."""
+        if radius is None:
+            radius = MAX_SEARCH_RADIUS
         if end_angle <= 0:
             return 0.0
         if end_angle >= 2 * pi:
@@ -110,9 +118,11 @@ class SectorManager:
         return self._calculate_sector_area(0, end_angle, radius)
 
     def _find_equal_area_sectors(
-        self, num_sectors: int, radius: float = MAX_SEARCH_RADIUS
+        self, num_sectors: int, radius: float | None = None
     ) -> list[float]:
         """Find sector boundaries that divide the searchable area into equal parts."""
+        if radius is None:
+            radius = MAX_SEARCH_RADIUS
         if num_sectors == 0:
             return [0, 2 * pi]
 
@@ -211,34 +221,75 @@ class SectorManager:
         else:
             return self.sector_start_angle <= angle <= self.sector_end_angle
 
-    def get_random_position_in_sector(self) -> tuple[float, float]:
-        """Generate a random position within sector and within max search radius of ark."""
-        for _ in range(POSITION_GENERATION_ATTEMPTS):
-            # Generate random angle within sector
-            if self.sector_start_angle > self.sector_end_angle:
-                # Wraps around
-                angle1 = uniform(self.sector_start_angle, 2 * pi)
-                angle2 = uniform(0, self.sector_end_angle)
-                angle = choice([angle1, angle2])
-            else:
-                angle = uniform(self.sector_start_angle, self.sector_end_angle)
+    def _get_all_cells_in_sector(self) -> list[tuple[int, int]]:
+        """Get a list of all cell coordinates in the sector."""
+        if self._sector_cells is not None:
+            return self._sector_cells
 
-            dist = uniform(0, MAX_SEARCH_RADIUS)
-            ark_x, ark_y = self.ark_position
-            x = ark_x + dist * cos(angle)
-            y = ark_y + dist * sin(angle)
-
-            # Clamp to grid boundaries
-            x = max(0, min(c.X - 1, x))
-            y = max(0, min(c.Y - 1, y))
-
-            if self.is_in_sector(x, y):
-                return (x, y)
-
-        # Fallback: return a position within max search radius
-        angle = uniform(0, 2 * pi)
-        dist = uniform(0, MAX_SEARCH_RADIUS)
+        cells: list[tuple[int, int]] = []
         ark_x, ark_y = self.ark_position
-        x = max(0, min(c.X - 1, ark_x + dist * cos(angle)))
-        y = max(0, min(c.Y - 1, ark_y + dist * sin(angle)))
-        return (x, y)
+
+        # Calculate bounds for cells within max_search_radius
+        max_radius_int = int(MAX_SEARCH_RADIUS) + 1
+        min_x = max(0, ark_x - max_radius_int)
+        max_x = min(c.X - 1, ark_x + max_radius_int)
+        min_y = max(0, ark_y - max_radius_int)
+        max_y = min(c.Y - 1, ark_y + max_radius_int)
+
+        # Check each cell
+        for x in range(min_x, max_x + 1):
+            for y in range(min_y, max_y + 1):
+                # Check if cell center is within max_search_radius
+                cell_center_x = x + 0.5
+                cell_center_y = y + 0.5
+                dx = cell_center_x - ark_x
+                dy = cell_center_y - ark_y
+                dist = sqrt(dx * dx + dy * dy)
+
+                if dist <= MAX_SEARCH_RADIUS and self.is_in_sector(
+                    cell_center_x, cell_center_y
+                ):
+                    cells.append((x, y))
+
+        self._sector_cells = cells
+        return cells
+
+    def get_random_position_in_sector(
+        self, visited_cells: set[tuple[int, int]] | None = None
+    ) -> tuple[float, float]:
+        """
+        Generate a random position within sector by selecting a random unvisited cell.
+        Returns the center of the selected cell.
+
+        Args:
+            visited_cells: Set of (x, y) tuples representing visited cell coordinates.
+                          If None or empty, all cells are available.
+
+        Returns:
+            (x, y) tuple representing the center of a cell (x + 0.5, y + 0.5)
+        """
+        if visited_cells is None:
+            visited_cells = set()
+
+        # Get all cells in sector
+        sector_cells = self._get_all_cells_in_sector()
+
+        if not sector_cells:
+            # Fallback: return ark position
+            return (
+                float(self.ark_position[0]) + 0.5,
+                float(self.ark_position[1]) + 0.5,
+            )
+
+        # Filter out visited cells
+        unvisited_cells = [cell for cell in sector_cells if cell not in visited_cells]
+
+        # If all cells are visited, use all cells
+        if not unvisited_cells:
+            unvisited_cells = sector_cells
+
+        # Select random cell
+        selected_cell = choice(unvisited_cells)
+
+        # Return center of cell
+        return (float(selected_cell[0]) + 0.5, float(selected_cell[1]) + 0.5)

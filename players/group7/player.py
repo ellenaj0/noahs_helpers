@@ -1,6 +1,7 @@
 """Player7: fresh helper redesign with stable pursuit and clear phases."""
 
 from __future__ import annotations
+
 import math
 from collections import deque
 
@@ -13,6 +14,11 @@ import core.constants as c
 
 
 class Player7(Player):
+    _group_last_logged: dict[int, int] = {}  # group_id -> last turn logged
+    _group_first_window_done: dict[
+        int, bool
+    ] = {}  # track per-group first-window completion
+
     def __init__(
         self,
         id: int,
@@ -25,25 +31,7 @@ class Player7(Player):
         super().__init__(id, ark_x, ark_y, kind, num_helpers, species_populations)
 
         # Tunables consolidated into config for easy tuning
-        self.config = {
-            "linger_turns": 3,
-            "block_after_fail": 3,  # Retry failed cells faster
-            "pursuit_hyst": 1.5,
-            "pursuit_lock": 2,
-            "recent_len": 10,
-            "eta_buffer": 10,
-            "recent_bias": 1.3,
-            "swap_threshold": 1.5,
-            "stuck_threshold": 3,
-            "give_up_turns": 7,
-        }
-
-        # Rarity and territory
-        self.rarity = self._compute_rarity()
-        self.territory = self._compute_territory()
-
-        # Linear formation state (optional for coordinated sweeps)
-        self._formation_spacing = c.MAX_SIGHT_KM * 0.8  # Stay within sight
+        self.config = self._init_config()
 
         # State
         self.turn = 0
@@ -73,32 +61,247 @@ class Player7(Player):
         self._stuck = 0
         # Track chase attempts per cell to avoid infinite chasing
         self._chase_attempts: dict[tuple[int, int], int] = {}
-        self._prev_flock_size = 0  # Track for failed obtain detection
+        self._prev_flock_size = 0
 
-        # Messaging: track what others are carrying and claiming
-        self._seen_carrying: dict[tuple[int, int], int] = {}
-        self._claimed: dict[tuple[int, int], int] = {}
-
-        # Communication system from comms_player
+        # Messaging
         self.priorities: set[tuple[int, int]] = set()
         self.messages_sent: set[int] = set()
         self.messages_to_send: list[int] = []
         self.last_seen_ark_animals: set[tuple[int, int]] = set()
+        self._seen_carrying: dict[tuple[int, int], int] = {}
+        self._claimed: dict[tuple[int, int], int] = {}
 
-        # Waiting position near ark for when multiple helpers return
-        # Spread helpers in a circle around ark
+        # Rarity
+        self.rarity = self._compute_rarity()
+        self.territory = self._compute_territory()
+
+        # Waiting / Formation
+        self._formation_spacing = c.MAX_SIGHT_KM * 0.8
         self._waiting_position = self._compute_waiting_position()
+
+        self.last_rendezvous_turn = 0
+
+    def _init_config(self) -> dict:
+        return {
+            "linger_turns": 3,
+            "block_after_fail": 3,
+            "pursuit_hyst": 1.5,
+            "pursuit_lock": 2,
+            "recent_len": 10,
+            "eta_buffer": 10,
+            "recent_bias": 1.3,
+            "swap_threshold": 1.5,
+            "stuck_threshold": 3,
+            "give_up_turns": 7,
+        }
+
+    def _init_sliding_window(self, num_groups: int):
+        """Initialize sliding window positions and rotation parameters."""
+        self.center_point = (c.X / 2, c.Y / 2)
+
+        # Base number of slots
+        self.num_slots = max(
+            1, min(50, num_groups * 2)
+        )  # use parameter, not self.num_groups
+        self.slot_angles = [
+            2 * math.pi * i / self.num_slots for i in range(self.num_slots)
+        ]
+
+        # Window sizing
+        self.window_half_size = max(20, min(c.X, c.Y) / (2 * num_groups))
+        self.window_radius = min(c.X, c.Y) / 2 - self.window_half_size
+
+        # Rotation state
+        self.slot_index = 0
+        self.last_slot_turn = self.turn
+        self.slot_turns = 50
+
+        # Precompute window centers in a circle
+        cx, cy = self.center_point
+        r = self.window_radius
+        self.precomputed_windows = [
+            (cx + r * math.cos(angle), cy + r * math.sin(angle))
+            for angle in self.slot_angles
+        ]
+        self.window_center = self.precomputed_windows[self.slot_index]
+
+        # Group tracking
+        self.group_helper_ids = []
+        self.in_rendezvous = True
+        self.group_rendezvous_started = True
+        self.rendezvous_interval = 500
+
+    def setup_groups(self, total_helpers):
+        """Compute number of groups, assign helpers and species."""
+        total_animals = sum(self.species_populations.values())
+        groups_by_species = math.ceil(total_animals / 16)
+        groups_by_helpers = math.ceil(total_helpers / 10)
+
+        # Decide number of groups (1 <= num_groups <= total_helpers <= num_slots)
+        self.num_groups = max(1, max(groups_by_species, groups_by_helpers))
+        self.num_groups = min(self.num_groups, total_helpers)
+
+        self._init_sliding_window(self.num_groups)
+
+        # Assign group ID
+        self.group_id = self.id % self.num_groups
+        self.group_helper_ids = [
+            hid
+            for hid in range(total_helpers)
+            if hid % self.num_groups == self.group_id
+        ]
+
+        # Disable rendezvous if group has only one helper
+        if len(self.group_helper_ids) <= 1:
+            self.in_rendezvous = False
+            self.group_rendezvous_started = False
+            self.rendezvous_interval = 0
+
+        # Assign initial slot to group (spread across slot circle)
+        slots_per_group = max(1, self.num_slots // self.num_groups)
+        self.slot_index = min(self.group_id * slots_per_group, self.num_slots - 1)
+        self.window_center = self.precomputed_windows[self.slot_index]
+        self.last_slot_turn = self.turn
+
+        # Assign species responsibility to this group
+        species_list = sorted(self.species_populations.keys())
+        for idx, letter in enumerate(species_list):
+            if idx % self.num_groups == self.group_id:
+                sid = ord(letter) - ord("a")
+                self.priorities.add((sid, 0))
+                self.priorities.add((sid, 1))
+
+        # print(f"[Setup Groups] Helper {self.id} in group {self.group_id}")
+        # print(f"Group members: {self.group_helper_ids}")
+        # print(f"Assigned slot: {self.slot_index}, Window center: {self.window_center}")
+        # print(f"Assigned species: {self.priorities}")
+
+    def _update_window_center(self):
+        """Rotate group to next slot if enough turns passed and not in rendezvous."""
+        if not self.precomputed_windows:
+            return
+
+        if self.in_rendezvous:
+            return
+
+        if (self.turn - self.last_slot_turn) < self.slot_turns:
+            return
+
+        # Rotate to next slot in circle
+        self.slot_index = (self.slot_index + 1) % self.num_slots
+        self.window_center = self.precomputed_windows[self.slot_index]
+        self.last_slot_turn = self.turn
+
+        last_logged = Player7._group_last_logged.get(self.group_id, -1)
+        if last_logged != self.turn:
+            Player7._group_last_logged[self.group_id] = self.turn
+            # print(f"[Group Rotation] Group {self.group_id} moved to slot {self.slot_index}, center {self.window_center}")
+
+    def _move_to_window(self):
+        """Move helper toward current window center if not already close."""
+        if self._dist_to_point(self.window_center) > 5.0:
+            return self._move_to(self.window_center)
+        return None
+
+    def _move_for_rendezvous(self):
+        """
+        Move toward assigned window. Periodic rendezvous starts after
+        the group has reached its first window.
+        """
+        group_id = self.group_id
+        dist_to_center = self._dist_to_point(self.window_center)
+
+        # move to assigned window if not already close
+        if dist_to_center > 5.0:
+            return self._move_to(self.window_center)
+
+        # Mark that this helper has reached its window
+        self.first_window_reached = True
+
+        # Initialize first-window done flag for the group
+        if group_id not in self._group_first_window_done:
+            self._group_first_window_done[group_id] = True
+            self.last_rendezvous_turn = self.turn
+            # print(f"[Group First Window Reached] Group {group_id} at turn {self.turn}")
+
+        # Only start a new rendezvous if interval elapsed
+        if (self.turn - self.last_rendezvous_turn) >= self.rendezvous_interval:
+            if not self.in_rendezvous:
+                self.in_rendezvous = True
+                # print(f"[Rendezvous Start] Group {group_id} starting rendezvous at turn {self.turn}")
+
+        # If currently in rendezvous, move toward window and check for completion
+        if self.in_rendezvous:
+            # Track visible group members
+            visible_group_members = set()
+            for cellview in self.sight:
+                if (
+                    math.hypot(
+                        cellview.x - self.position[0], cellview.y - self.position[1]
+                    )
+                    <= 5.0
+                ):
+                    for helper in cellview.helpers:
+                        if helper.id in self.group_helper_ids:
+                            visible_group_members.add(helper.id)
+            visible_group_members.add(self.id)
+
+            group_ready = visible_group_members >= set(self.group_helper_ids)
+
+            if dist_to_center > 5.0:
+                return self._move_to(self.window_center)
+
+            if group_ready:
+                self.in_rendezvous = False
+                self.last_rendezvous_turn = self.turn
+                # print(f"[Rendezvous Complete] Group {group_id} finished rendezvous at turn {self.turn}")
+
+    def _dist_to_point(self, point):
+        x, y = self.position
+        px, py = point
+        return ((x - px) ** 2 + (y - py) ** 2) ** 0.5
+
+    def _explore_within_window(self):
+        """
+        Explore but constrained to the sliding window.
+        """
+
+        t = self.territory
+
+        # save original territory
+        orig_min_x = t["min_x"]
+        orig_max_x = t["max_x"]
+        orig_min_y = t["min_y"]
+        orig_max_y = t["max_y"]
+
+        # apply window bounds
+        wx, wy = self.window_center
+        half = self.window_half_size
+
+        t["min_x"] = int(max(0, wx - half))
+        t["max_x"] = int(min(c.X - 1, wx + half))
+        t["min_y"] = int(max(0, wy - half))
+        t["max_y"] = int(min(c.Y - 1, wy + half))
+
+        # explore using modified territory window
+        mv = self._explore()
+
+        # restore territory
+        t["min_x"] = orig_min_x
+        t["max_x"] = orig_max_x
+        t["min_y"] = orig_min_y
+        t["max_y"] = orig_max_y
+
+        return mv
 
     def check_surroundings(self, snapshot: HelperSurroundingsSnapshot) -> int:
         self.last_snapshot = snapshot
+        self.sight = snapshot.sight
         self._update_state(snapshot)
 
         # Initialize priorities on first turn
         if self.turn == 1 and self.kind != Kind.Noah:
-            for letter in self.species_populations.keys():
-                sid = ord(letter) - ord("a")
-                self.priorities.add((sid, 0))  # Male
-                self.priorities.add((sid, 1))  # Female
+            self.setup_groups(self.num_helpers - 1)
 
         # Process ark view for communication
         if snapshot.ark_view:
@@ -133,6 +336,23 @@ class Player7(Player):
 
         self._process_messages(messages)
 
+        self._update_window_center()
+
+        # Move toward the window center if not at it
+
+        if (self.turn - self.last_slot_turn) >= self.slot_turns:
+            mv = self._move_to_window()
+            if mv:
+                return mv
+
+        # Only then do other behavior like pursuit / explore / ark
+
+        # rendezvous movement
+        if self.in_rendezvous:
+            mv = self._move_for_rendezvous()
+            if mv:
+                return mv
+
         # If in ark with empty flock, leave immediately
         if self.is_in_ark() and len(self.flock) == 0:
             # Clear behaviors and move to territory center
@@ -141,6 +361,12 @@ class Player7(Player):
             self._stuck = 0
             t = self.territory
             return self._move_to((t["cx"], t["cy"]))
+
+        if self.is_raining:
+            if not self.is_in_ark():
+                return Move(*self.move_towards(*self.ark_position))
+            else:
+                return None  # Already on ark
 
         if self._should_return():
             # When returning, prioritize getting to ark
@@ -244,7 +470,7 @@ class Player7(Player):
                     return Release(animal)
             return None
 
-        return self._explore()
+        return self._explore_within_window()
 
     # -------- State & messages --------
 
@@ -365,15 +591,18 @@ class Player7(Player):
                     heapq.heappush(self.messages_to_send, b)
                     self.messages_sent.add(b)
 
-            # Legacy protocol support
-            female = (b >> 5) & 1
-            have = (b >> 6) & 1
-            claiming = (b >> 7) & 1
-            g = Gender.Female if female else Gender.Male
-            if have:
-                self._seen_carrying[(sid, g.value)] = self.turn
-            if claiming:
-                self._claimed[(sid, g.value)] = self.turn
+            # Legacy protocol support:
+            # Only apply for messages that DON'T use the new from_ark/from_local flags.
+            # This avoids misinterpreting our new encoding and corrupting `_claimed`.
+            if not from_ark and not from_local:
+                female = (b >> 5) & 1
+                have = (b >> 6) & 1
+                claiming = (b >> 7) & 1
+                g = Gender.Female if female else Gender.Male
+                if have:
+                    self._seen_carrying[(sid, g.value)] = self.turn
+                if claiming:
+                    self._claimed[(sid, g.value)] = self.turn
 
     # -------- Decision helpers --------
 
@@ -446,12 +675,12 @@ class Player7(Player):
                 for f in self.flock
             ):
                 continue
-            # Skip animals already in the ark
+            # Skip animals already in the ark (no extra value)
             if self._is_in_ark(a.species_id, a.gender):
                 continue
-            # Skip claimed targets from other helpers
-            if (a.species_id, a.gender.value) in self._claimed:
-                continue
+            # IMPORTANT: do NOT skip just because of `_claimed` here.
+            # If we're physically on the same cell as the animal, it's cheap
+            # to pick it up, even if another helper "claimed" that species+gender.
 
             # Prioritize animals in priority set
             is_priority = (a.species_id, a.gender.value) in self.priorities

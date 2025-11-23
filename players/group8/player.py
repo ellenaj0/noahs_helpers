@@ -17,12 +17,13 @@ RAIN_COUNTDOWN_START = 990
 CHECKED_ANIMAL_RADIUS = 3
 CHECKED_ANIMAL_EXPIRY_TURNS = 50
 MAX_RECENT_UPDATES = 4
-MAX_ENCODED_SPECIES_ID = 64
+MAX_ENCODED_SPECIES_ID = 85  # Using mod 3 and // 3 since state_code 0 isn't sent
 BASE_PICKUP_PROBABILITY_BOOST = 0.1
 OPPOSITE_GENDER_IN_ARK_MULTIPLIER = 5.0
 OPPOSITE_GENDER_IN_FLOCK_MULTIPLIER = 3.0
 MIN_RARITY_FACTOR = 2.0
 RELEASE_DISTANCE_FROM_ARK = 50.0
+NO_ANIMAL_ADDED_RETURN_TURNS = 500
 
 
 def distance(x1: float, y1: float, x2: float, y2: float) -> float:
@@ -54,7 +55,11 @@ class Player8(Player):
             self.num_helpers,
             self.id,
         )
-        self.target_position = self.sector_manager.get_random_position_in_sector()
+        # Track visited cells (cells that have been in sight)
+        self.visited_cells: set[tuple[int, int]] = set()
+        self.target_position = self.sector_manager.get_random_position_in_sector(
+            self.visited_cells
+        )
 
         # Internal ark state tracking: {species_id: (has_male, has_female)}
         self.ark_state: dict[int, tuple[bool, bool]] = {}
@@ -62,6 +67,10 @@ class Player8(Player):
 
         # Track animals we've checked for gender (to ignore in adjacent cells)
         self.checked_animals: dict[tuple[int, int, int], int] = {}
+
+        # Track when last animal was added to flock
+        self.last_animal_added_turn: int = 0
+        self.prev_flock_size: int = 0
 
         # State for handling rare animal pickup when flock is full
         self.pending_obtain: Animal | None = None
@@ -118,8 +127,9 @@ class Player8(Player):
         if msg == 0:
             return
 
-        state_code = msg % 4
-        species_id = msg // 4
+        # Decode: state_code = (msg % 3) + 1, species_id = msg // 3
+        state_code = (msg % 3) + 1  # Map 0-2 back to 1-3
+        species_id = msg // 3
 
         # Decode state
         reported_male, reported_female = self._decode_state_code(state_code)
@@ -156,11 +166,17 @@ class Player8(Player):
             self.current_turn % len(self.recent_updates)
         ]
 
-        # Encode: species_id * 4 + state_code
+        # Encode: species_id * 3 + (state_code - 1)
+        # Since state_code 0 is never sent, we only use 1-3, which we map to 0-2
         if species_id >= MAX_ENCODED_SPECIES_ID:
-            return 0  # Can't encode species_id >= 64
+            return 0
 
-        return species_id * 4 + state_code
+        # Map state_code 1-3 to 0-2 for encoding
+        encoded = species_id * 3 + (state_code - 1)
+        if encoded > 255:  # Check if it fits in 1 byte
+            return 0
+
+        return encoded
 
     # Pickup and release logic
 
@@ -400,13 +416,26 @@ class Player8(Player):
         self.is_raining = snapshot.is_raining
         self.current_turn = snapshot.time_elapsed
 
+        # Check if flock size increased (animal was added)
+        current_flock_size = len(self.flock)
+        if current_flock_size > self.prev_flock_size:
+            self.last_animal_added_turn = self.current_turn
+        self.prev_flock_size = current_flock_size
+
         self._update_rain_state(was_raining)
         self._mark_animals_as_checked()
+
+        # Track visited cells (cells in sight)
+        if self.sight is not None:
+            for cellview in self.sight:
+                self.visited_cells.add((cellview.x, cellview.y))
 
         # Update ark state if at ark
         if snapshot.ark_view is not None:
             self.ark_view = snapshot.ark_view
             self._update_ark_state_from_view()
+            # Reset counter when at ark (helps update status)
+            self.last_animal_added_turn = self.current_turn
 
         return self._encode_message()
 
@@ -423,6 +452,13 @@ class Player8(Player):
 
         dist_from_ark = self._distance_from_ark()
         return dist_from_ark >= self.rain_countdown
+
+    def _should_return_due_to_no_progress(self) -> bool:
+        """Determine if we should return to ark due to no animal added in X turns."""
+        if self.is_in_ark() or len(self.flock) < 3:
+            return False  # Already at ark, reset counter
+        turns_since_last_add = self.current_turn - self.last_animal_added_turn
+        return turns_since_last_add >= NO_ANIMAL_ADDED_RETURN_TURNS
 
     def _handle_pending_obtain(self) -> Action | None:
         """Handle pending obtain action if applicable."""
@@ -463,9 +499,13 @@ class Player8(Player):
     def _update_target_if_needed(self):
         """Update target position if we've reached it or are at ark."""
         if self.is_in_ark():
-            self.target_position = self.sector_manager.get_random_position_in_sector()
+            self.target_position = self.sector_manager.get_random_position_in_sector(
+                self.visited_cells
+            )
         elif self._has_reached_target():
-            self.target_position = self.sector_manager.get_random_position_in_sector()
+            self.target_position = self.sector_manager.get_random_position_in_sector(
+                self.visited_cells
+            )
 
     def get_action(self, messages: list[Message]) -> Action | None:
         """Get next action based on current state and messages."""
@@ -479,6 +519,10 @@ class Player8(Player):
 
         # Handle rain: head back if needed
         if self._should_head_back_to_ark():
+            return Move(*self.move_towards(*self.ark_position))
+
+        # Return to ark if no animal added in X turns
+        if self._should_return_due_to_no_progress():
             return Move(*self.move_towards(*self.ark_position))
 
         # Release an animal if it's no longer needed (only if far from ark)

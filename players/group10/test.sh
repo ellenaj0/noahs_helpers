@@ -10,14 +10,15 @@ PLAYER="10"
 NUM_HELPERS=8
 
 # Animal populations (space-separated list)
-ANIMALS="10 20 40 60 80 100 120 140"
+# ANIMALS="10 20 40 60 80 100 120 140 160 180"
+ANIMALS="10 20 20 20 40 40 40 60 60 60"
 
 # Ark position (X Y coordinates)
-ARK_X=500
-ARK_Y=500
+ARK_X=550
+ARK_Y=350
 
 # Simulation duration (turns)
-TIME=2500
+TIME=4000
 
 # Random seed for reproducibility
 SEED=12345

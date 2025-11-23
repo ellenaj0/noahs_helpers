@@ -6,6 +6,7 @@ from core.player import Player
 from core.snapshots import HelperSurroundingsSnapshot
 from core.views.player_view import Kind
 from core.views.cell_view import CellView
+from core.animal import Gender
 
 
 def distance(x1: float, y1: float, x2: float, y2: float) -> float:
@@ -30,7 +31,11 @@ class SearchAndRescue(Player):
         self.mode = "waiting"
         self.direction = (0, 0)
         self.internal_ark = set()
+        self.complete_species = set()
+
         self.countdown = 0
+        self.rain = False
+        self.timer = 1008
 
     def _get_my_cell(self) -> CellView:
         xcell, ycell = tuple(map(int, self.position))
@@ -38,6 +43,16 @@ class SearchAndRescue(Player):
             raise Exception(f"{self} failed to find own cell")
 
         return self.sight.get_cellview_at(xcell, ycell)
+
+    def animal_to_tuple(self, animal):
+        s_id = animal.species_id
+        if animal.gender == Gender.Male:
+            g = 0
+        elif animal.gender == Gender.Female:
+            g = 1
+        else:
+            g = 2
+        return (s_id, g)
 
     def _find_closest_animal(self) -> tuple[int, int] | None:
         closest_animal = None
@@ -47,7 +62,10 @@ class SearchAndRescue(Player):
             if len(cellview.animals) > 0:
                 for animal in cellview.animals:
                     dist = distance(*self.position, cellview.x, cellview.y)
-                    if (animal.species_id, animal.gender) not in self.internal_ark:
+                    if (
+                        (animal.species_id, animal.gender) not in self.internal_ark
+                        and animal.species_id not in self.complete_species
+                    ):
                         if closest_animal is None:
                             closest_animal = animal
                             closest_dist = dist
@@ -67,7 +85,7 @@ class SearchAndRescue(Player):
             dx, dy = randint(0, 1000), randint(0, 1000)
             # print(dx, dy, count)
             # input()
-            if distance(dx, dy, self.ark_position[0], self.ark_position[0]) < 1000:
+            if distance(dx, dy, self.ark_position[0], self.ark_position[1]) < 1000:
                 break
 
         return dx, dy
@@ -82,13 +100,16 @@ class SearchAndRescue(Player):
         self.sight = snapshot.sight
         self.is_raining = snapshot.is_raining
 
+        """Update internal arc information"""
         if snapshot.ark_view is not None:
             arc_animals = set()
             for animal in snapshot.ark_view.animals:
-                id_number, gender = animal.species_id, animal.gender
-                arc_animals.add((id_number, gender))
-            # print(snapshot.ark_view.animals)
+                arc_animals.add(self.animal_to_tuple(animal))
             self.internal_ark = arc_animals
+            for tuple in arc_animals:
+                s_id = tuple[0]
+                if (s_id, 0) in arc_animals and (s_id, 1) in arc_animals:
+                    self.complete_species.add(s_id)
 
         # if I didn't receive any messages, broadcast "hello"
         # a "hello" message is when a player's id bit is set
@@ -108,6 +129,7 @@ class SearchAndRescue(Player):
         return msg
 
     def get_action(self, messages: list[Message]) -> Action | None:
+        # print(self.mode)
         # print(self.internal_ark)
         for msg in messages:
             if 1 << (msg.from_helper.id % 8) == msg.contents:
@@ -117,17 +139,38 @@ class SearchAndRescue(Player):
         if self.kind == Kind.Noah:
             return None
 
-        # If it's raining, go to ark
-        if self.is_raining:
+        # Get your ass back to the ark now
+        if self.mode == "get_back":
             return Move(*self.move_towards(*self.ark_position))
+
+        """If it's raining, keep searching. However, if you are too close to 
+        the deadline, set mode to get_back to immediatly travel to the arc"""
+        if self.rain:
+            self.timer -= 1
+            if (
+                self.timer
+                - distance(
+                    self.position[0],
+                    self.position[1],
+                    self.ark_position[0],
+                    self.ark_position[1],
+                )
+                <= 20
+            ):
+                self.mode = "get_back"
+
+        if self.is_raining and not self.rain:
+            self.rain = True
 
         # If I have obtained an animal, go to ark
         if not self.is_flock_empty():
             return Move(*self.move_towards(*self.ark_position))
 
+        """If a helper checked and animal and noted it is already in the arc
+        we use this function to force a 10 move walk"""
         if self.mode == "move_away":
             if self.countdown <= 0:
-                self.mode = "waiting"
+                self.mode = "moving"
             else:
                 self.countdown -= 1
                 return Move(*self.move_towards(*self.direction))
@@ -136,18 +179,22 @@ class SearchAndRescue(Player):
         cellview = self._get_my_cell()
         if len(cellview.animals) > 0:
             for animal in cellview.animals:
-                if (animal.species_id, animal.gender) not in self.internal_ark:
-                    # # This means the random_player will even attempt to
+                if (
+                    (animal.species_id, animal.gender) not in self.internal_ark
+                    and animal.species_id not in self.complete_species
+                ):
+                    # # This means the random_player will even attempt t
                     # # (unsuccessfully) obtain animals in other helpers' flocks
                     # random_animal = choice(tuple(cellview.animals))
                     return Obtain(animal)
-            direction = self._get_random_location()
+            # direction = self._get_random_location()
             self.mode = "move_away"
-            self.direction = direction
+            # self.direction = direction
             self.countdown = 10
             return Move(*self.move_towards(*self.direction))
 
-        # If I see any animals, I'll chase the closest one
+        """If I see any animals that might not be in the arc, I'll chase the 
+        closest one"""
         closest_animal = self._find_closest_animal()
         if closest_animal:
             # This means the random_player will even approach

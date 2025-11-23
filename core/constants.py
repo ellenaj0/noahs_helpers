@@ -1,3 +1,7 @@
+"""
+Define local constants in ./_constants.py
+"""
+
 X = Y = 1000
 
 MAX_ANIMALS_PER_HELPER = 4
@@ -61,3 +65,11 @@ INFO_HELPER_HEIGHT = 60
 
 # Precision
 EPS = 0.01
+
+try:
+    from . import _constants as local_constants  # type: ignore[import-not-found]
+
+    for const in dir(local_constants):
+        globals()[const] = getattr(local_constants, const)
+except ImportError:
+    pass

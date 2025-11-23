@@ -1,0 +1,16 @@
+test_name,num_helpers,num_species,total_animals,density,ark_pos,score,execution_time,status
+edge_maximal_helpers_50_species_32_density_500_ark_500_500,50,32,16000,500,"500,500",3200,243.32225251197815,success
+helpers_10_species_32_density_100_ark_500_500,10,32,3200,100,"500,500",3002,44.505910873413086,success
+helpers_10_species_16_density_100_ark_0_500,10,16,1600,100,"0,500",1600,35.47090744972229,success
+helpers_10_species_16_density_100_ark_500_500,10,16,1600,100,"500,500",1600,36.69548845291138,success
+helpers_10_species_16_density_200_ark_500_500,10,16,3200,200,"500,500",1600,45.64683675765991,success
+helpers_20_species_16_density_100_ark_500_500,20,16,1600,100,"500,500",1600,52.815999031066895,success
+helpers_10_species_16_density_50_ark_500_500,10,16,800,50,"500,500",1501,32.13529443740845,success
+helpers_10_species_16_density_100_ark_0_0,10,16,1600,100,"0,0",1500,33.536110639572144,success
+helpers_5_species_16_density_100_ark_500_500,5,16,1600,100,"500,500",1402,30.059807538986206,success
+helpers_10_species_8_density_100_ark_500_500,10,8,800,100,"500,500",800,32.378294467926025,success
+helpers_10_species_16_density_10_ark_500_500,10,16,160,10,"500,500",609,27.67736506462097,success
+helpers_2_species_16_density_100_ark_500_500,2,16,1600,100,"500,500",507,24.82686686515808,success
+helpers_10_species_4_density_100_ark_500_500,10,4,400,100,"500,500",400,29.417351722717285,success
+helpers_10_species_256_density_100_ark_500_500,10,256,25600,100,"500,500",0,0,"error: ord() expected a character, but string of length 2 found"
+edge_minimal_helpers_2_species_4_density_10_ark_500_500,2,4,40,10,"500,500",0,13.462315797805786,success

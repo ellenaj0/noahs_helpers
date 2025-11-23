@@ -33,7 +33,7 @@ class Player(ABC):
         self.species_populations = species_populations
 
     def __str__(self) -> str:
-        return f"{self.__module__.split('.')[-1]}"
+        return self.__class__.__name__
 
     def __repr__(self) -> str:
         return str(self)

@@ -1,0 +1,41 @@
+if we need a girl zebra (have a boy zebra)
+but then we go and look at a zebra we don't know the zebra of and its a boy
+how do we prevent from going back to that boy zebra over and over
+how do we mark it as an incorrect zebra so we don't ping pong back to it
+
+what if we create like a belief map of where incorrect things are
+and that expands but lowers probability as time goes on
+
+did something similar in pacman ghost CTF about locations of enemy ghosts based
+on noisy readings
+
+
+
+
+need to update our seen animals list across all helpers (via communication)
+
+maybe we don't want to search top-left first necessarily
+maybe every other helper starts the opposite of the one before
+{
+    helper 1: start top left of column and move left to right and down,
+    helper 2: start bottom right of column and move right to left and up,
+    etc.
+}
+
+we have extra time while its raining that we could take advantage of, right now we all just return as soon as it starts raining
+
+
+maybe we can use rarity of animals to do priority so we maybe drop more common animals for less common animals (while on our way back to the ark?)
+    need to make sure we don't continually drop/pickup animals and thrash
+
+
+maybe its wise to overlook common animals and search for the rare animals instead
+
+
+maybe we go out and keep track of who we see but don't pick up anyone really until we are on our way back. so we have a period of exploration instead of just trying to get all the animals we see as we go along... but this trades off because we will take longer to return to the ark initially, and being closer to the ark is probably going to be where we can go to receive more information
+
+maybe when there are two helpers close enough together to communicate and they can also both see an animal in their view, they communicate and decide for only one of them to go get that animal so we don't have two helpers chasing a single animal.
+
+there is no upper limit on number of species? this is a challenge for communication/messages which are limited to one byte
+    - maybe helpers ask and respond to questions instead of broadcasting information?
+    - or maybe the communication policy is verbose, and centralized through noah, and helpers stay and hang out with noah to hear about all the information he has, and also tell noah all the information they have, even if it takes many turns

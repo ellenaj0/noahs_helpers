@@ -148,9 +148,7 @@ class Engine:
                             f"helper {hi.id} tried to obtain animal with full flock"
                         )
 
-                    placed = self.animals[a]
-
-                    match placed:
+                    match self.animals[a]:
                         case Cell() as cell:
                             if cell != helper_cell or a not in helper_cell.animals:
                                 raise Exception(

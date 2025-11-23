@@ -1,17 +1,12 @@
 import math
-from random import choice, random
+import random
+from core.action import Action, Move, Obtain
 from core.animal import Animal
 from core.message import Message
 from core.player import Player
 from core.snapshots import HelperSurroundingsSnapshot
-from core.views.cell_view import CellView
 from core.views.player_view import Kind
-from core.action import Action, Move, Obtain
 import core.constants as c
-
-
-def distance(x1: float, y1: float, x2: float, y2: float) -> float:
-    return (abs(x1 - x2) ** 2 + abs(y1 - y2) ** 2) ** 0.5
 
 
 class Player3(Player):
@@ -25,126 +20,327 @@ class Player3(Player):
         species_populations: dict[str, int],
     ):
         super().__init__(id, ark_x, ark_y, kind, num_helpers, species_populations)
-        self.ark_species: set[Animal] = set()
-        self.is_raining = False
-        self.hellos_received = []
-        self.angle = math.radians(random() * 360)
+        self.ark_x = ark_x
+        self.ark_y = ark_y
+        self.my_angle = None  # My exploration angle
+        self.snapshot = None
+        self.caught_species = {}  # {species_id: {'M': bool, 'F': bool}}
+        self.last_10_positions = []  # Track last 10 positions to detect stuck state
+        self.max_safe_distance = 840  # Max distance from ark to ensure we can return (1008 turns / 1.2 safety)
+        self.first_trip_complete = False  # Track if we've returned to ark at least once
+
+    def need_animal(self, species_id: int, gender_name: str) -> bool:
+        """Check if we need this species/gender combination."""
+        # Only check for known genders
+        if gender_name not in ["Male", "Female"]:
+            return False  # Can't determine if we need Unknown gender
+
+        gender_key = "M" if gender_name == "Male" else "F"
+
+        if species_id not in self.caught_species:
+            return True
+
+        return not self.caught_species[species_id].get(gender_key, False)
+
+    def mark_caught(self, species_id: int, gender_name: str):
+        """Mark that we've caught this species/gender."""
+        # Only mark known genders
+        if gender_name not in ["Male", "Female"]:
+            return  # Can't mark Unknown gender
+
+        gender_key = "M" if gender_name == "Male" else "F"
+
+        if species_id not in self.caught_species:
+            self.caught_species[species_id] = {"M": False, "F": False}
+
+        self.caught_species[species_id][gender_key] = True
+
+    def find_needed_animal(
+        self, snapshot: HelperSurroundingsSnapshot
+    ) -> tuple[int, int, Animal] | None:
+        """Find closest animal that we need (haven't caught both genders)."""
+        best_animal = None
+        best_distance = float("inf")
+
+        for cell_view in snapshot.sight:
+            for animal in cell_view.animals:
+                # Can only see gender if in same cell
+                current_cell_x = int(self.position[0])
+                current_cell_y = int(self.position[1])
+
+                if cell_view.x == current_cell_x and cell_view.y == current_cell_y:
+                    # We can see the gender, check if we need it
+                    if self.need_animal(animal.species_id, animal.gender.name):
+                        return (cell_view.x, cell_view.y, animal)
+                else:
+                    # Can't see gender from distance, but check if we might need this species
+                    # If we need either gender of this species, consider it
+                    if animal.species_id not in self.caught_species:
+                        # Haven't caught any of this species yet
+                        dx = cell_view.x + 0.5 - self.position[0]
+                        dy = cell_view.y + 0.5 - self.position[1]
+                        distance = math.sqrt(dx * dx + dy * dy)
+
+                        if distance < best_distance:
+                            best_distance = distance
+                            best_animal = (cell_view.x, cell_view.y, animal)
+                    elif not (
+                        self.caught_species[animal.species_id].get("M", False)
+                        and self.caught_species[animal.species_id].get("F", False)
+                    ):
+                        # Have caught one gender but not both
+                        dx = cell_view.x + 0.5 - self.position[0]
+                        dy = cell_view.y + 0.5 - self.position[1]
+                        distance = math.sqrt(dx * dx + dy * dy)
+
+                        if distance < best_distance:
+                            best_distance = distance
+                            best_animal = (cell_view.x, cell_view.y, animal)
+
+        return best_animal
+
+    def get_distance_from_ark(self) -> float:
+        """Calculate current distance from ark."""
+        # Position is always at integer coordinates
+        dx = int(self.position[0]) - self.ark_x
+        dy = int(self.position[1]) - self.ark_y
+        return math.sqrt(dx * dx + dy * dy)
+
+    def is_safe_to_move(self, new_x: float, new_y: float) -> bool:
+        """Check if moving to new position is safe (can still return in time)."""
+        # Calculate distance from new position to ark
+        dx = new_x - self.ark_x
+        dy = new_y - self.ark_y
+        new_distance = math.sqrt(dx * dx + dy * dy)
+
+        # Don't venture beyond max safe distance
+        return new_distance <= self.max_safe_distance
+
+    def is_stuck_in_vicinity(self) -> bool:
+        """Check if stuck in same area for last 10 turns."""
+        if len(self.last_10_positions) < 10:
+            return False
+
+        # Calculate the centroid of last 10 positions
+        avg_x = sum(x for x, y in self.last_10_positions) / 10
+        avg_y = sum(y for x, y in self.last_10_positions) / 10
+
+        # Check if all positions are within 10km radius of centroid
+        max_distance_from_center = 0
+        for x, y in self.last_10_positions:
+            distance = math.sqrt((x - avg_x) ** 2 + (y - avg_y) ** 2)
+            max_distance_from_center = max(max_distance_from_center, distance)
+
+        # If all positions within 10km radius, we're stuck chasing
+        return max_distance_from_center <= 10
+
+    def move_toward_ark(self) -> Move:
+        """Move up to 1km toward the ark (integer coordinates only)."""
+        # Current position as integers
+        curr_x = int(self.position[0])
+        curr_y = int(self.position[1])
+
+        dx = self.ark_x - curr_x
+        dy = self.ark_y - curr_y
+        distance = math.sqrt(dx * dx + dy * dy)
+
+        if distance == 0:
+            return Move(curr_x, curr_y)
+
+        # Move up to 1km toward ark
+        scale = min(1.0, distance) / distance
+        new_x = curr_x + dx * scale
+        new_y = curr_y + dy * scale
+
+        # Round to integer coordinates
+        new_x = round(new_x)
+        new_y = round(new_y)
+
+        return Move(float(new_x), float(new_y))
 
     def check_surroundings(self, snapshot: HelperSurroundingsSnapshot) -> int:
+        # Store snapshot
+        self.snapshot = snapshot
+
+        # Set my angle on first turn
+        if self.my_angle is None:
+            # Each helper gets a unique direction
+            self.my_angle = (self.id / self.num_helpers) * 2 * math.pi
+
+        # Detect successful delivery BEFORE updating flock
+        # (flock changes from non-empty to empty when we unload at ark)
+        if snapshot.ark_view is not None:
+            current_cell_x = int(snapshot.position[0])
+            current_cell_y = int(snapshot.position[1])
+            if current_cell_x == self.ark_x and current_cell_y == self.ark_y:
+                # We're at the ark - check if we just unloaded
+                if len(self.flock) > 0 and len(snapshot.flock) == 0:
+                    # Flock went from non-empty to empty = successful delivery
+                    self.first_trip_complete = True
+
+        # Update position and flock
         self.position = snapshot.position
         self.flock = snapshot.flock
-        if snapshot.ark_view:
-            self.ark_species.update(snapshot.flock)
 
-        self.sight = snapshot.sight
-        self.is_raining = snapshot.is_raining
+        # Sync with Ark contents whenever we can see it
+        if snapshot.ark_view is not None:
+            for animal in snapshot.ark_view.animals:
+                # Animals on ark have known genders
+                self.mark_caught(animal.species_id, animal.gender.name)
 
-        # if I didn't receive any messages, broadcast "hello"
-        # a "hello" message is when a player's id bit is set
-        if len(self.hellos_received) == 0:
-            msg = 1 << (self.id % 8)
-        else:
-            # else, acknowledge all "hello"'s I got last turn
-            # do this with a bitwise OR of all IDs I got
-            msg = 0
-            for hello in self.hellos_received:
-                msg |= hello
-            self.hellos_received = []
+        # Track last 10 positions
+        self.last_10_positions.append((self.position[0], self.position[1]))
+        if len(self.last_10_positions) > 10:
+            self.last_10_positions.pop(0)  # Keep only last 10
 
-        if not self.is_message_valid(msg):
-            msg = msg & 0xFF
-
-        return msg
+        return 0
 
     def get_action(self, messages: list[Message]) -> Action | None:
-        for msg in messages:
-            if 1 << (msg.from_helper.id % 8) == msg.contents:
-                self.hellos_received.append(msg.contents)
-        # noah shouldn't do anything
+        """Move radially outward, chase animals we need, catch them, come back."""
         if self.kind == Kind.Noah:
             return None
 
-        # If it's raining, go to ark
-        if self.is_raining:
-            return Move(*self.move_towards(*self.ark_position))
+        if not self.snapshot or self.my_angle is None:
+            return None
 
-        # if self.is_flock_full():
-        #     return Move(*self.move_towards(*self.ark_position))
+        current_cell_x = int(self.position[0])
+        current_cell_y = int(self.position[1])
 
-        # If I have obtained an animal, go to ark
-        if not self.is_flock_empty():
-            return Move(*self.move_towards(*self.ark_position))
+        # Try to catch animal if in same cell and have room
+        if len(self.flock) < 4:
+            for cell_view in self.snapshot.sight:
+                if cell_view.x == current_cell_x and cell_view.y == current_cell_y:
+                    for animal in cell_view.animals:
+                        # Safety check: only catch if gender is known (should always be true in same cell)
+                        if animal.gender.name not in ["Male", "Female"]:
+                            continue  # Skip Unknown genders
 
-        # If I've reached an animal, I'll obtain it
-        """ cellview = self._get_my_cell()
-        if len(cellview.animals) > 0:
-            # This means the random_player will even attempt to
-            # (unsuccessfully) obtain animals in other helpers' flocks
-            random_animal = choice(tuple(cellview.animals))
-            return Obtain(random_animal) """
+                        # Check if we need this animal
+                        if self.need_animal(animal.species_id, animal.gender.name):
+                            # Mark it as caught
+                            self.mark_caught(animal.species_id, animal.gender.name)
+                            return Obtain(animal)
 
-        # don't move too far from the ark
-        if distance(*self.position, self.ark_position[0], self.ark_position[1]) >= 1007:
-            self.angle = math.radians(random() * 360)
-            print("distance too far")
-            return Move(*self.move_towards(*self.ark_position))
+        # Return to ark conditions:
+        # - First trip: 2 animals (quick sync with ark)
+        # - Later trips: 4 animals (max capacity)
+        # - Always return if raining
+        target_flock_size = 2 if not self.first_trip_complete else 4
+        if len(self.flock) >= target_flock_size or self.snapshot.is_raining:
+            return self.move_toward_ark()
 
-        cellview = self._get_my_cell()
-        cellview.animals
-        # grab an animal that does not appear to be in flock or in the ark
-        if len(cellview.animals) > 0:
-            for animal in cellview.animals:
-                if animal not in self.ark_species and animal not in self.flock:
-                    print("obtained")
-                    return Obtain(animal)
+        # Check if stuck in same vicinity for last 10 turns
+        if self.is_stuck_in_vicinity():
+            # Stop chasing, clear position history, and move forward
+            self.last_10_positions.clear()
+            # Will continue with normal radial exploration below
 
-        # If I see any animals, I'll chase the closest one
-        closest_animal = self._find_closest_animal()
-        if closest_animal:
-            dist_animal = distance(*self.position, *closest_animal)
-            if dist_animal > 0.01 and dist_animal <= 3:
-                print("move towards animal")
-                # This means the random_player will even approach
-                # animals in other helpers' flocks
-                return Move(*self.move_towards(*closest_animal))
+        # Look for animals we need (only if not stuck)
+        elif len(self.flock) < 4:
+            animal_target = self.find_needed_animal(self.snapshot)
 
-        return Move(*self.move_dir())
+            if animal_target:
+                target_x, target_y, animal = animal_target
 
-    def get_distance(self, from_x, from_y, to_x, to_y):
-        print(math.sqrt((to_x - from_x) ** 2 + (to_y - from_y) ** 2))
-        return math.sqrt((to_x - from_x) ** 2 + (to_y - from_y) ** 2)
+                # Current position as integers
+                curr_x = int(self.position[0])
+                curr_y = int(self.position[1])
 
-    def _get_my_cell(self) -> CellView:
-        xcell, ycell = tuple(map(int, self.position))
-        if not self.sight.cell_is_in_sight(xcell, ycell):
-            raise Exception(f"{self} failed to find own cell")
+                # Move toward animal (animal is at integer coordinates)
+                dx = target_x - curr_x
+                dy = target_y - curr_y
+                distance = math.sqrt(dx * dx + dy * dy)
 
-        return self.sight.get_cellview_at(xcell, ycell)
+                if distance > 0:
+                    # Move up to 1km toward target
+                    scale = min(1.0, distance) / distance
+                    new_x = curr_x + dx * scale
+                    new_y = curr_y + dy * scale
 
-    def _find_closest_animal(self) -> tuple[int, int] | None:
-        closest_animal = None
-        closest_dist = -1
-        closest_pos = None
-        for cellview in self.sight:
-            if len(cellview.animals) > 0:
-                dist = distance(*self.position, cellview.x, cellview.y)
-                if closest_animal is None or dist < closest_dist:
-                    closest_animal = choice(tuple(cellview.animals))
-                    closest_dist = dist
-                    closest_pos = (cellview.x, cellview.y)
+                    # Round to integer coordinates
+                    new_x = round(new_x)
+                    new_y = round(new_y)
 
-        return closest_pos
+                    new_x = max(0, min(c.X - 1, new_x))
+                    new_y = max(0, min(c.Y - 1, new_y))
 
-    def move_dir(self) -> tuple[float, float]:
-        step_size = c.MAX_DISTANCE_KM * 0.99
-        x0, y0 = self.position
-        x1, y1 = (
-            x0 + step_size * math.cos(self.angle),
-            y0 + step_size * math.sin(self.angle),
-        )
-        if self.can_move_to(x1, y1):
-            # print(x1, y1)
-            return x1, y1
-        print("move away")
-        self.angle = math.radians(random() * 360)
-        return x0, y0
+                    # Only chase if it's safe to do so
+                    if self.is_safe_to_move(new_x, new_y):
+                        return Move(float(new_x), float(new_y))
+
+        # Default: Move radially outward
+        # Current position as integers
+        curr_x = int(self.position[0])
+        curr_y = int(self.position[1])
+
+        # Check if another helper is at our current position
+        for cell_view in self.snapshot.sight:
+            if cell_view.x == curr_x and cell_view.y == curr_y:
+                for helper_view in cell_view.helpers:
+                    if helper_view.id != self.id and helper_view.kind == Kind.Helper:
+                        # Another helper is here! Adjust our angle to spread out
+                        self.my_angle += math.radians(30)  # Turn 30 degrees
+                        self.my_angle %= 2 * math.pi
+                        break
+
+        dx = math.cos(self.my_angle)
+        dy = math.sin(self.my_angle)
+
+        new_x = curr_x + dx
+        new_y = curr_y + dy
+
+        # Round to integer coordinates
+        new_x = round(new_x)
+        new_y = round(new_y)
+
+        # Check if we hit a boundary and need to rebound
+        hit_boundary = False
+        if new_x <= 0 or new_x >= c.X - 1:
+            # Hit left or right boundary - reflect angle horizontally
+            self.my_angle = math.pi - self.my_angle
+            hit_boundary = True
+        if new_y <= 0 or new_y >= c.Y - 1:
+            # Hit top or bottom boundary - reflect angle vertically
+            self.my_angle = -self.my_angle
+            hit_boundary = True
+
+        # Normalize angle to [0, 2π)
+        self.my_angle = self.my_angle % (2 * math.pi)
+
+        # If we hit a boundary, recalculate movement with new angle
+        if hit_boundary:
+            dx = math.cos(self.my_angle)
+            dy = math.sin(self.my_angle)
+            new_x = curr_x + dx
+            new_y = curr_y + dy
+            new_x = round(new_x)
+            new_y = round(new_y)
+
+        # Clamp to grid boundaries
+        new_x = max(0, min(c.X - 1, new_x))
+        new_y = max(0, min(c.Y - 1, new_y))
+
+        # Safety check: Don't move if it would take us too far from ark
+        if not self.is_safe_to_move(new_x, new_y):
+            # Too far from ark, bounce back inward
+            # Reflect angle to point more toward ark
+            ark_dx = self.ark_x - curr_x
+            ark_dy = self.ark_y - curr_y
+            ark_angle = math.atan2(ark_dy, ark_dx)
+
+            # Bounce: reflect our angle toward the ark
+            # Add some randomness (±45 degrees) so helpers explore different areas
+            offset = random.uniform(-math.pi / 4, math.pi / 4)
+            self.my_angle = ark_angle + offset
+
+            # Recalculate move with new angle
+            dx = math.cos(self.my_angle)
+            dy = math.sin(self.my_angle)
+            new_x = curr_x + dx
+            new_y = curr_y + dy
+            new_x = round(new_x)
+            new_y = round(new_y)
+            new_x = max(0, min(c.X - 1, new_x))
+            new_y = max(0, min(c.Y - 1, new_y))
+
+        return Move(float(new_x), float(new_y))

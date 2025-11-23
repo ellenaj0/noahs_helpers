@@ -46,6 +46,11 @@ class Player2(Player):
         self.visited_cells = set()
         self.current_target_cell = None
 
+        # Zigzag path variable
+        self.zigzag_path = None
+
+        self.clock = 0
+
     def _get_my_cell(self) -> CellView:
         xcell, ycell = tuple(map(int, self.position))
         if not self.sight.cell_is_in_sight(xcell, ycell):
@@ -138,6 +143,53 @@ class Player2(Player):
 
         return dx, dy
 
+    def make_zigzag_path(self, start, end, steps=10, amplitude=40):
+        sx, sy = start
+        tx, ty = end
+
+        path = []
+
+        dx = tx - sx
+        dy = ty - sy
+        length = (dx**2 + dy**2) ** 0.5 or 1
+        dx /= length
+        dy /= length
+
+        # perpendicular vector
+        px = -dy
+        py = dx
+
+        # boundaries
+        xmin, xmax = 0, 999
+        ymin, ymax = 0, 999
+
+        def clamp(v, lo, hi):
+            return max(lo, min(v, hi))
+
+        for i in range(steps + 1):
+            t = i / steps
+
+            # point along line
+            lx = sx + (tx - sx) * t
+            ly = sy + (ty - sy) * t
+
+            # zig (even) or zag (odd)
+            offset = amplitude if i % 2 else -amplitude
+
+            zx = lx + px * offset
+            zy = ly + py * offset
+
+            # clamp inside bounding box
+            zx = clamp(zx, xmin, xmax)
+            zy = clamp(zy, ymin, ymax)
+
+            path.append((zx, zy))
+
+        # final endpoint
+        path.append(end)
+
+        return path
+
     def check_surroundings(self, snapshot: HelperSurroundingsSnapshot) -> int:
         # I can't trust that my internal position and flock matches the simulators
         # For example, I wanted to move in a way that I couldn't
@@ -195,6 +247,7 @@ class Player2(Player):
         return msg
 
     def get_action(self, messages: list[Message]) -> Action | None:
+        self.clock += 1
         # print(self.mode)
         # print(self.internal_ark)
         for msg in messages:
@@ -228,14 +281,19 @@ class Player2(Player):
         if self.is_raining and not self.rain:
             self.rain = True
 
-        # If I have obtained an animal, go to ark
-        if not self.is_flock_empty():
-            # Now heading to ark
+        # If I have obtained 3 animals, zig zag back
+        if len(self.flock) == 3:
+            # CLEAR zigzag path so we don't continue it later
+            self.zigzag_path = None
+            self.current_target_cell = None
+
+            # Now heading to ark, straight back
             self.direction = self.ark_position
             return Move(*self.move_towards(*self.ark_position))
 
         """If a helper checked and animal and noted it is already in the arc
         we use this function to force a 10 move walk"""
+        print(f"coundown: {self.countdown}")
         if self.mode == "move_away":
             if self.countdown <= 0:
                 self.mode = "moving"
@@ -245,11 +303,14 @@ class Player2(Player):
 
         # If I've reached an animal, I'll obtain it
         cellview = self._get_my_cell()
+        print(cellview.animals)
         if len(cellview.animals) > 0:
             for animal in cellview.animals:
                 if (
                     (animal.species_id, animal.gender) not in self.internal_ark
                     and animal.species_id not in self.complete_species
+                    and (animal.species_id, animal.gender)
+                    not in [(a.species_id, a.gender) for a in self.flock]
                 ):
                     # # This means the random_player will even attempt t
                     # # (unsuccessfully) obtain animals in other helpers' flocks
@@ -267,14 +328,20 @@ class Player2(Player):
         if closest_animal:
             # This means the random_player will even approach
             # animals in other helpers' flocks
+            # print(f"[Clock {self.clock}] Player {self.id} moving toward animal at {closest_animal} from {self.position}")
             return Move(*self.move_towards(*closest_animal))
 
-        # Systematic grid exploration
+        # Systematic grid exploration (w/ zig-zag path)
         if self.mode == "waiting":
             # Pick a new grid cell to explore
             direction = self._get_next_grid_target()
             self.mode = "moving"
-            self.direction = direction
+            # ZIG ZAG PATH
+            self.zigzag_path = self.make_zigzag_path(
+                self.position, direction, steps=15, amplitude=20
+            )
+            self.direction = self.zigzag_path.pop(0)
+            # ZIG ZAG PATH
             return Move(*self.move_towards(*self.direction))
         else:
             # Check if we've reached our target grid cell
@@ -289,10 +356,18 @@ class Player2(Player):
 
             # Check if close to direction target
             if distance(*self.position, *self.direction) < 10:
-                # Pick new grid cell
+                # Pick next path in zig zag grid cell
+                if self.zigzag_path:
+                    self.direction = self.zigzag_path.pop(0)
+                    return Move(*self.move_towards(*self.direction))
+
+                # No more zig zag path, pick new grid cell
                 direction = self._get_next_grid_target()
+                self.zigzag_path = self.make_zigzag_path(
+                    self.position, direction, steps=15, amplitude=20
+                )
                 self.mode = "moving"
-                self.direction = direction
+                self.direction = self.zigzag_path.pop(0)
                 return Move(*self.move_towards(*self.direction))
             else:
                 # Keep moving toward current target
