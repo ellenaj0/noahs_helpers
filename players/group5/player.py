@@ -73,8 +73,28 @@ class Player5(Player):
         self.is_exploring_fan_out = True
 
         self.ignore_list = []  # List of species_ids where internal duplicates were found
-        self.max_explore_dis = 100  # technically 200 at turn 1
+        # Adjust initial exploration distance based on number of helpers
+        # With fewer helpers, we need to explore further out to cover more ground
+        num_searching_helpers = max(1, num_helpers - 1)  # Exclude Noah
+        # Base distance of 100, but increase when there are fewer helpers
+        # With 2 helpers: 100 + 200 = 300; with 10 helpers: 100 + 0 = 100
+        self.max_explore_dis = 100 + max(0, (5 - num_searching_helpers) * 40)
+        self.max_explore_dis = min(400, self.max_explore_dis)  # Cap at 400
 
+        # --- Grid-based Exploration System ---
+        # Divide the map into a grid for systematic exploration
+        # Grid cell size: 50x50 units (20x20 grid cells for 1000x1000 map)
+        self.grid_cell_size = 50.0
+        self.grid_width = int(math.ceil((MAX_MAP_COORD - MIN_MAP_COORD + 1) / self.grid_cell_size))
+        self.grid_height = int(math.ceil((MAX_MAP_COORD - MIN_MAP_COORD + 1) / self.grid_cell_size))
+        
+        # Track visited grid cells: (grid_x, grid_y) -> visit_count
+        self.visited_grid_cells: Dict[Tuple[int, int], int] = {}
+        
+        # Track recent positions for distance-based weighting
+        self.recent_positions: List[Tuple[float, float]] = []
+        self.max_recent_positions = 20  # Keep last 20 positions
+        
         # --- Specialization Logic Initialization ---
         self.is_specialized = True
         # Specialization limit is now a Group ID (1000, 2000, etc.), not a population count.
@@ -354,8 +374,204 @@ class Player5(Player):
 
         return Move(x=new_x, y=new_y)
 
-    def _get_new_random_target(self, current_pos: Tuple[float, float]) -> Move:
-        """Picks a new 150km point for the triangle exploration."""
+    def _get_grid_cell(self, x: float, y: float) -> Tuple[int, int]:
+        """Convert world coordinates to grid cell coordinates."""
+        grid_x = int((x - MIN_MAP_COORD) / self.grid_cell_size)
+        grid_y = int((y - MIN_MAP_COORD) / self.grid_cell_size)
+        # Clamp to valid grid bounds
+        grid_x = max(0, min(self.grid_width - 1, grid_x))
+        grid_y = max(0, min(self.grid_height - 1, grid_y))
+        return (grid_x, grid_y)
+
+    def _get_grid_center(self, grid_x: int, grid_y: int) -> Tuple[float, float]:
+        """Get the center point of a grid cell in world coordinates."""
+        center_x = MIN_MAP_COORD + (grid_x + 0.5) * self.grid_cell_size
+        center_y = MIN_MAP_COORD + (grid_y + 0.5) * self.grid_cell_size
+        return (center_x, center_y)
+
+    def _update_visited_grid_cell(self, position: Tuple[float, float]):
+        """Mark the grid cell containing the given position as visited."""
+        grid_x, grid_y = self._get_grid_cell(position[0], position[1])
+        self.visited_grid_cells[(grid_x, grid_y)] = self.visited_grid_cells.get((grid_x, grid_y), 0) + 1
+        
+        # Update recent positions list
+        self.recent_positions.append(position)
+        if len(self.recent_positions) > self.max_recent_positions:
+            self.recent_positions.pop(0)
+
+    def _get_cell_visit_score(self, grid_x: int, grid_y: int) -> float:
+        """
+        Calculate a score for a grid cell based on visit frequency.
+        Lower score = less visited = more desirable.
+        Returns a value between 0.0 (never visited) and 1.0 (heavily visited).
+        """
+        visit_count = self.visited_grid_cells.get((grid_x, grid_y), 0)
+        # Use a logarithmic scale to prevent extreme penalties
+        # Never visited = 0.0, visited once = 0.3, visited 5+ times = 1.0
+        if visit_count == 0:
+            return 0.0
+        return min(1.0, 0.3 + (visit_count - 1) * 0.15)
+
+    def _get_distance_to_recent_positions(self, x: float, y: float) -> float:
+        """
+        Calculate the minimum distance from the given point to any recent position.
+        This helps avoid areas we've recently explored.
+        """
+        if not self.recent_positions:
+            return 0.0
+        
+        min_dist = float('inf')
+        for pos in self.recent_positions:
+            dist = self._get_distance((x, y), pos)
+            min_dist = min(min_dist, dist)
+        
+        return min_dist
+
+    def _get_strategic_target(self, current_pos: Tuple[float, float]) -> Tuple[float, float]:
+        """
+        Selects a strategic target cell using grid-based exploration.
+        Prioritizes unvisited or less-visited areas while avoiding backtracking.
+        """
+        current_x, current_y = current_pos
+        prev_x, prev_y = self.previous_position
+        
+        # Calculate previous movement direction
+        prev_dx = current_x - prev_x
+        prev_dy = current_y - prev_y
+        prev_mag = math.sqrt(prev_dx**2 + prev_dy**2) if (prev_dx != 0 or prev_dy != 0) else 1.0
+        
+        # Candidate grid cells to evaluate
+        candidates: List[Tuple[int, int, float]] = []  # (grid_x, grid_y, score)
+        
+        # Search radius in grid cells - expand when there are fewer helpers
+        # With fewer helpers, we need to look further to find good targets
+        num_searching_helpers = max(1, self.num_helpers - 1)  # Exclude Noah
+        base_radius = 3  # Base radius of 3 grid cells (~150 units)
+        # With 2 helpers, radius = 5; with 10 helpers, radius = 3
+        search_radius = int(base_radius + max(0, (5 - num_searching_helpers) * 0.3))
+        search_radius = max(3, min(6, search_radius))  # Clamp between 3 and 6
+        
+        # Get current grid cell
+        current_grid_x, current_grid_y = self._get_grid_cell(current_x, current_y)
+        
+        # Evaluate candidate grid cells within search radius
+        for dx in range(-search_radius, search_radius + 1):
+            for dy in range(-search_radius, search_radius + 1):
+                grid_x = current_grid_x + dx
+                grid_y = current_grid_y + dy
+                
+                # Skip invalid grid cells
+                if grid_x < 0 or grid_x >= self.grid_width or grid_y < 0 or grid_y >= self.grid_height:
+                    continue
+                
+                # Get world coordinates of grid cell center
+                cell_center_x, cell_center_y = self._get_grid_center(grid_x, grid_y)
+                cell_pos = (cell_center_x, cell_center_y)
+                
+                # Check bounds and ark distance constraints
+                if not (MIN_MAP_COORD <= cell_center_x <= MAX_MAP_COORD and 
+                       MIN_MAP_COORD <= cell_center_y <= MAX_MAP_COORD):
+                    continue
+                
+                # Strict 1000 unit limit after turn 1000, slightly more lenient before
+                max_allowed_distance = 950.0 if self.time_elapsed >= 1000 else 1000.0
+                if self._get_distance(cell_pos, self.ark_pos) > max_allowed_distance:
+                    continue
+                
+                # Calculate distance from current position
+                dist_to_cell = self._get_distance(current_pos, cell_pos)
+                
+                # Skip cells that are too close (already explored)
+                if dist_to_cell < 20.0:
+                    continue
+                
+                # Calculate score components
+                visit_score = self._get_cell_visit_score(grid_x, grid_y)  # 0.0 = unvisited, 1.0 = heavily visited
+                distance_to_recent = self._get_distance_to_recent_positions(cell_center_x, cell_center_y)
+                
+                # Calculate distance from ark
+                distance_from_ark = self._get_distance(cell_pos, self.ark_pos)
+                
+                # Prefer cells that are:
+                # 1. Less visited (lower visit_score)
+                # 2. Further from recently visited areas (higher distance_to_recent)
+                # 3. At reasonable distance (not too close, not too far)
+                # 4. Further from ark (especially when few helpers)
+                # 5. Not backtracking (angle check)
+                
+                # Base score: inverse of visit frequency (unvisited = high score)
+                base_score = 1.0 - visit_score
+                
+                # Distance bonus: prefer cells further from recent positions
+                recent_bonus = min(1.0, distance_to_recent / 100.0)  # Normalize to 0-1
+                
+                # Distance penalty: prefer cells around TARGET_POINT_DISTANCE away
+                ideal_distance = TARGET_POINT_DISTANCE
+                distance_penalty = 1.0 - abs(dist_to_cell - ideal_distance) / ideal_distance
+                distance_penalty = max(0.0, distance_penalty)  # Clamp to 0-1
+                
+                # Distance from ark bonus: encourage exploring further from ark
+                # After turn 1000, use stricter limit to prevent going too far
+                max_ark_distance = 950.0 if self.time_elapsed >= 1000 else 1000.0
+                ark_distance_score = distance_from_ark / max_ark_distance
+                
+                # When there are fewer helpers, we need to explore further out
+                # Adjust the weight based on number of helpers (excluding Noah)
+                # After turn 1000, reduce the weight to discourage going too far
+                num_searching_helpers = max(1, self.num_helpers - 1)  # Exclude Noah
+                # With 2 helpers, weight is 0.5; with 10 helpers, weight is 0.1
+                # This means fewer helpers = stronger push to explore far
+                base_weight = max(0.1, 0.6 - (num_searching_helpers - 1) * 0.05)
+                # After turn 1000, reduce weight by 50% to be more conservative
+                if self.time_elapsed >= 1000:
+                    base_weight *= 0.5
+                ark_distance_weight = min(0.5, base_weight)  # Cap at 0.5
+                
+                # Combined score with adaptive ark distance weighting
+                score = (base_score * 0.4 + 
+                        recent_bonus * 0.25 + 
+                        distance_penalty * 0.15 + 
+                        ark_distance_score * ark_distance_weight)
+                
+                # Check backtracking angle (if we have previous movement)
+                if prev_mag > c.EPS:
+                    new_dx = cell_center_x - current_x
+                    new_dy = cell_center_y - current_y
+                    new_mag = math.sqrt(new_dx**2 + new_dy**2)
+                    
+                    if new_mag > c.EPS:
+                        dot_product = prev_dx * new_dx + prev_dy * new_dy
+                        cos_angle = dot_product / (prev_mag * new_mag)
+                        cos_angle = max(-1.0, min(1.0, cos_angle))
+                        angle_diff = math.acos(cos_angle)
+                        
+                        # Penalize backtracking (160-200 degree angles)
+                        if BACKTRACK_MIN_ANGLE <= angle_diff <= BACKTRACK_MAX_ANGLE:
+                            score *= 0.3  # Heavy penalty for backtracking
+                
+                candidates.append((grid_x, grid_y, score))
+        
+        # If we found candidates, select the best one
+        if candidates:
+            # Sort by score (highest first)
+            candidates.sort(key=lambda x: x[2], reverse=True)
+            
+            # Select from top candidates with some randomness for exploration
+            # Take top 30% of candidates and randomly select from them
+            top_count = max(1, int(len(candidates) * 0.3))
+            top_candidates = candidates[:top_count]
+            
+            # Randomly select from top candidates
+            selected = top_candidates[int(random() * len(top_candidates))]
+            grid_x, grid_y, _ = selected
+            
+            return self._get_grid_center(grid_x, grid_y)
+        
+        # Fallback: if no good candidates found, use the old random method
+        return self._get_new_random_target_fallback(current_pos)
+
+    def _get_new_random_target_fallback(self, current_pos: Tuple[float, float]) -> Tuple[float, float]:
+        """Fallback to original random target selection if strategic search fails."""
         current_x, current_y = current_pos
         prev_x, prev_y = self.previous_position
 
@@ -363,13 +579,15 @@ class Player5(Player):
         prev_dy = current_y - prev_y
 
         max_tries = 1000
+        # After turn 1000, use stricter distance limit
+        max_allowed_distance = 950.0 if self.time_elapsed >= 1000 else 1000.0
         for _ in range(max_tries):
             angle = random() * 2 * math.pi
             target_x = current_x + math.cos(angle) * TARGET_POINT_DISTANCE
             target_y = current_y + math.sin(angle) * TARGET_POINT_DISTANCE
             target_pos = (target_x, target_y)
 
-            if self._get_distance(target_pos, self.ark_pos) > 1000.0:
+            if self._get_distance(target_pos, self.ark_pos) > max_allowed_distance:
                 continue
             if not (
                 MIN_MAP_COORD <= target_x <= MAX_MAP_COORD
@@ -384,21 +602,23 @@ class Player5(Player):
             mag_new = math.sqrt(new_dx**2 + new_dy**2)
 
             if mag_prev < c.EPS or mag_new < c.EPS:
-                self.current_target_pos = target_pos
-                return self._get_move_to_target(current_pos, target_pos)
+                return target_pos
 
             cos_angle = dot_product / (mag_prev * mag_new)
             cos_angle = max(-1.0, min(1.0, cos_angle))
             angle_diff = math.acos(cos_angle)
 
             if not (BACKTRACK_MIN_ANGLE <= angle_diff <= BACKTRACK_MAX_ANGLE):
-                self.current_target_pos = target_pos
-                return self._get_move_to_target(current_pos, target_pos)
+                return target_pos
 
-        if self.current_target_pos:
-            return self._get_move_to_target(current_pos, self.current_target_pos)
+        # Last resort: return a position near current
+        return (current_x + random() - 0.5, current_y + random() - 0.5)
 
-        return Move(x=current_x + random() - 0.5, y=current_y + random() - 0.5)
+    def _get_new_random_target(self, current_pos: Tuple[float, float]) -> Move:
+        """Picks a new strategic target using grid-based exploration."""
+        target_pos = self._get_strategic_target(current_pos)
+        self.current_target_pos = target_pos
+        return self._get_move_to_target(current_pos, target_pos)
 
     def _get_return_move(
         self, current_pos: Tuple[float, float], direct: bool = False
@@ -469,10 +689,11 @@ class Player5(Player):
             if self.position_is_in_cell(cell_view.x, cell_view.y):
                 continue
 
-            # Avoid targeting cells that are already beyond the 1000-unit
-            # safe radius from the Ark.
+            # Avoid targeting cells that are already beyond the safe radius from the Ark.
+            # After turn 1000, use stricter 950 unit limit
+            max_safe_distance = 950.0 if self.time_elapsed >= 1000 else 1000.0
             cell_center = (cell_view.x + 0.5, cell_view.y + 0.5)
-            if self._get_distance(cell_center, self.ark_pos) > 1000.0:
+            if self._get_distance(cell_center, self.ark_pos) > max_safe_distance:
                 continue
 
             if not cell_view.helpers:
@@ -541,6 +762,9 @@ class Player5(Player):
 
         self.previous_position = self.position
 
+        # Update grid visit tracking
+        self._update_visited_grid_cell(self.position)
+
         # Clear target if we were chasing and are now in the *old* target cell
         if self.animal_target_cell and self.position_is_in_cell(
             self.animal_target_cell.x, self.animal_target_cell.y
@@ -554,7 +778,21 @@ class Player5(Player):
         if self.time_elapsed > 0 and self.time_elapsed % 50 == 0:
             self.ignore_list.clear()
         if self.time_elapsed % 1000 == 0:
-            self.max_explore_dis += 100
+            # After turn 1000, strictly enforce 1000 unit limit
+            if self.time_elapsed >= 1000:
+                # Cap at 950 to stay well within 1000 unit safety limit
+                self.max_explore_dis = min(950, self.max_explore_dis)
+            else:
+                # Before turn 1000, can increase exploration distance
+                num_searching_helpers = max(1, self.num_helpers - 1)
+                increment = 100 + max(0, (5 - num_searching_helpers) * 20)
+                self.max_explore_dis += increment
+                # Cap at 900 to stay within 1000 unit safety limit
+                self.max_explore_dis = min(900, self.max_explore_dis)
+        
+        # Additional safety: after turn 1000, always cap at 950
+        if self.time_elapsed >= 1000:
+            self.max_explore_dis = min(950, self.max_explore_dis)
 
         # --- PRINT STATEMENT FOR SPECIES STATS (Restored) ---
         if self.time_elapsed == 0:
@@ -576,10 +814,11 @@ class Player5(Player):
         current_x, current_y = self.position
         current_pos = (current_x, current_y)
 
-        # Hard safety cap: if we're already beyond the 1000-unit radius from
+        # Hard safety cap: if we're already beyond the allowed radius from
         # the Ark, abandon any active targets and return directly toward the Ark.
-        # If it is raining, must return immediately and DIRECTLY if cutting it close
-        if self._get_distance(current_pos, self.ark_pos) > 1000.0:
+        # After turn 1000, use stricter 950 unit limit
+        max_safe_distance = 950.0 if self.time_elapsed >= 1000 else 1000.0
+        if self._get_distance(current_pos, self.ark_pos) > max_safe_distance:
             self.animal_target_cell = None
             self.current_target_pos = None
             return self._get_return_move(current_pos, direct=True)
@@ -685,7 +924,9 @@ class Player5(Player):
             target_cell_center = (target_cell_x + 0.5, target_cell_y + 0.5)
             # If the chase target lies outside the allowed radius, abandon it
             # and head back toward the Ark instead.
-            if self._get_distance(target_cell_center, self.ark_pos) > 1000.0:
+            # After turn 1000, use stricter 950 unit limit
+            max_safe_distance = 950.0 if self.time_elapsed >= 1000 else 1000.0
+            if self._get_distance(target_cell_center, self.ark_pos) > max_safe_distance:
                 self.animal_target_cell = None
                 self.current_target_pos = None
                 return self._get_return_move(current_pos, direct=False)
@@ -698,9 +939,10 @@ class Player5(Player):
             new_target_cell = self._find_needed_animal_in_sight()
             if new_target_cell:
                 target_cell_center = (new_target_cell.x + 0.5, new_target_cell.y + 0.5)
-                # Only commit to a chase target that keeps us within 1000 units
-                # of the Ark.
-                if self._get_distance(target_cell_center, self.ark_pos) <= 1000.0:
+                # Only commit to a chase target that keeps us within the safe radius
+                # of the Ark. After turn 1000, use stricter 950 unit limit
+                max_safe_distance = 950.0 if self.time_elapsed >= 1000 else 1000.0
+                if self._get_distance(target_cell_center, self.ark_pos) <= max_safe_distance:
                     self.animal_target_cell = new_target_cell
                     return self._get_move_to_target(current_pos, target_cell_center)
 
@@ -779,9 +1021,11 @@ class Player5(Player):
         # Continue movement
         # If the currently set exploration target would place us outside the
         # allowed radius, abandon it and head back to the Ark.
+        # After turn 1000, use stricter 950 unit limit
+        max_safe_distance = 950.0 if self.time_elapsed >= 1000 else 1000.0
         if (
             self.current_target_pos is not None
-            and self._get_distance(self.current_target_pos, self.ark_pos) > 1000.0
+            and self._get_distance(self.current_target_pos, self.ark_pos) > max_safe_distance
         ):
             self.current_target_pos = None
             return self._get_return_move(current_pos, direct=False)
