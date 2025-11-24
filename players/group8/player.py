@@ -1,4 +1,5 @@
 from random import random
+from math import cos, sin, pi, atan2
 
 from core.action import Action, Move, Obtain, Release
 from core.message import Message
@@ -7,6 +8,7 @@ from core.snapshots import HelperSurroundingsSnapshot
 from core.views.player_view import Kind
 from core.views.cell_view import CellView
 from core.animal import Animal, Gender
+import core.constants as c
 
 from .sector_manager import SectorManager
 
@@ -24,6 +26,10 @@ OPPOSITE_GENDER_IN_FLOCK_MULTIPLIER = 3.0
 MIN_RARITY_FACTOR = 2.0
 RELEASE_DISTANCE_FROM_ARK = 50.0
 NO_ANIMAL_ADDED_RETURN_TURNS = 500
+SWEEP_RING_STEP_KM = 10.0
+SWEEP_ARC_SPACING_KM = 10.0
+REVISIT_COOLDOWN_TURNS = 600
+RANDOM_TARGET_PROBABILITY = 0.5
 
 
 def distance(x1: float, y1: float, x2: float, y2: float) -> float:
@@ -57,9 +63,16 @@ class Player8(Player):
         )
         # Track visited cells (cells that have been in sight)
         self.visited_cells: set[tuple[int, int]] = set()
-        self.target_position = self.sector_manager.get_random_position_in_sector(
-            self.visited_cells
-        )
+        # Track last seen turn for cooldown-based revisit avoidance
+        self.last_seen: dict[tuple[int, int], int] = {}
+        # Polar sweep state
+        self._sweep_ring_index: int = 1  # start just outside the ark cell
+        self._sweep_points_in_ring: int = 8
+        self._sweep_angle_index: int = 0
+        self._reset_sweep_ring()
+        self._route_waypoints: list[tuple[float, float]] = []
+        self._target_was_random: bool = False
+        self._set_next_target()
 
         # Internal ark state tracking: {species_id: (has_male, has_female)}
         self.ark_state: dict[int, tuple[bool, bool]] = {}
@@ -388,6 +401,157 @@ class Player8(Player):
         dist = distance(*self.position, *self.target_position)
         return dist <= TARGET_REACHED_DELTA
 
+    def _reset_sweep_ring(self):
+        """Prepare sweep parameters for the current ring."""
+        r = max(0.0, self._sweep_ring_index * SWEEP_RING_STEP_KM)
+        # Ensure at least a handful of points even for small r
+        if r < 1e-6:
+            self._sweep_points_in_ring = 8
+        else:
+            circumference = 2.0 * pi * r
+            points = int(max(8, round(circumference / max(1.0, SWEEP_ARC_SPACING_KM))))
+            self._sweep_points_in_ring = points
+        self._sweep_angle_index = 0
+
+    def _recently_seen_set(self) -> set[tuple[int, int]]:
+        """Cells seen within the cooldown window."""
+        cutoff = self.current_turn - REVISIT_COOLDOWN_TURNS
+        return {cell for cell, t in self.last_seen.items() if t > cutoff}
+
+    def _get_random_target(self) -> tuple[float, float]:
+        """Pick a random target in sector, excluding recently seen cells."""
+        recently_seen = self._recently_seen_set()
+        return self.sector_manager.get_random_position_in_sector(recently_seen)
+
+    def _get_next_sweep_target(self) -> tuple[float, float]:
+        """
+        Generate the next sweep target using polar 'lawnmower' rings.
+        Returns the center of an in-bounds cell within this helper's sector.
+        """
+        max_attempts = 5000
+        attempts = 0
+        while attempts < max_attempts:
+            attempts += 1
+            r = max(0.0, self._sweep_ring_index * SWEEP_RING_STEP_KM)
+            # Compute angle for this step
+            denom = max(1, self._sweep_points_in_ring)
+            angle = (2.0 * pi) * (self._sweep_angle_index / denom)
+            # Compute candidate cell coordinates around the ark
+            float_x = self.ark_position[0] + r * cos(angle)
+            float_y = self.ark_position[1] + r * sin(angle)
+            xcell = int(float_x)
+            ycell = int(float_y)
+            # Advance state for next call
+            self._sweep_angle_index += 1
+            if self._sweep_angle_index >= self._sweep_points_in_ring:
+                self._sweep_ring_index += 1
+                self._reset_sweep_ring()
+            # Bounds check
+            if xcell < 0 or xcell >= c.X or ycell < 0 or ycell >= c.Y:
+                continue
+            # Sector check using cell center
+            cx = float(xcell) + 0.5
+            cy = float(ycell) + 0.5
+            if not self.sector_manager.is_in_sector(cx, cy):
+                continue
+            # Cooldown: skip if recently seen
+            if (xcell, ycell) in self._recently_seen_set():
+                continue
+            return (cx, cy)
+        # Fallback to random (cooldown-aware) if we couldn't find a sweep target
+        return self._get_random_target()
+
+    def _choose_next_target(self) -> tuple[float, float]:
+        """Mix between sweep and random targets to balance coverage and exploration."""
+        if random() < RANDOM_TARGET_PROBABILITY:
+            self._target_was_random = True
+            return self._get_random_target()
+        self._target_was_random = False
+        return self._get_next_sweep_target()
+
+    def _in_bounds_and_in_sector(self, x: float, y: float) -> bool:
+        xcell = int(x)
+        ycell = int(y)
+        if xcell < 0 or xcell >= c.X or ycell < 0 or ycell >= c.Y:
+            return False
+        cx = float(xcell) + 0.5
+        cy = float(ycell) + 0.5
+        return self.sector_manager.is_in_sector(cx, cy)
+
+    def _build_sweep_route_to_target(
+        self, dest: tuple[float, float]
+    ) -> list[tuple[float, float]]:
+        """
+        Build a short sequence of arc-and-radial waypoints around the Ark toward a destination.
+        Produces a sweeping path while still heading to the random target.
+        """
+        ax, ay = self.ark_position
+        px, py = self.position
+        tx, ty = dest
+        # Current and target polar coordinates around ark
+        rp = max(0.0, distance(px, py, ax, ay))
+        rt = max(0.0, distance(tx, ty, ax, ay))
+        thetap = atan2(py - ay, px - ax)
+        thetat = atan2(ty - ay, tx - ax)
+        # Normalize smallest angular difference
+        dtheta = thetat - thetap
+        while dtheta > pi:
+            dtheta -= 2.0 * pi
+        while dtheta < -pi:
+            dtheta += 2.0 * pi
+        # Arc steps: about SWEEP_ARC_SPACING_KM per step along current radius
+        arc_len = abs(rp * dtheta)
+        arc_steps = int(min(8, max(3, round(arc_len / max(1.0, SWEEP_ARC_SPACING_KM)))))
+        # Radial steps: SWEEP_RING_STEP_KM increments toward target radius
+        radial_len = abs(rt - rp)
+        radial_steps = int(
+            min(8, max(0, round(radial_len / max(1.0, SWEEP_RING_STEP_KM))))
+        )
+        waypoints: list[tuple[float, float]] = []
+        # Arc segment
+        for i in range(1, arc_steps + 1):
+            angle = thetap + (dtheta * i) / max(1, arc_steps)
+            x = ax + rp * cos(angle)
+            y = ay + rp * sin(angle)
+            if not self._in_bounds_and_in_sector(x, y):
+                continue
+            cx = float(int(x)) + 0.5
+            cy = float(int(y)) + 0.5
+            # Avoid immediate re-visit if recently seen
+            if (int(cx), int(cy)) in self._recently_seen_set():
+                continue
+            waypoints.append((cx, cy))
+            if len(waypoints) >= 6:
+                break
+        # Radial segment from last angle to target radius
+        base_angle = thetap + dtheta
+        for j in range(1, radial_steps + 1):
+            rj = rp + (rt - rp) * (j / max(1, radial_steps))
+            x = ax + rj * cos(base_angle)
+            y = ay + rj * sin(base_angle)
+            if not self._in_bounds_and_in_sector(x, y):
+                continue
+            cx = float(int(x)) + 0.5
+            cy = float(int(y)) + 0.5
+            if (int(cx), int(cy)) in self._recently_seen_set():
+                continue
+            waypoints.append((cx, cy))
+            if len(waypoints) >= 10:
+                break
+        # Always end with the destination
+        waypoints.append(dest)
+        return waypoints
+
+    def _set_next_target(self):
+        """Pick and set the next target, and build a sweep route if appropriate."""
+        next_target = self._choose_next_target()
+        self.target_position = next_target
+        # Build waypoints only for random targets to add sweeping motion en route
+        if self._target_was_random:
+            self._route_waypoints = self._build_sweep_route_to_target(next_target)
+        else:
+            self._route_waypoints = []
+
     def _update_rain_state(self, was_raining: bool):
         """Update rain countdown state."""
         if self.is_raining and not was_raining:
@@ -429,6 +593,7 @@ class Player8(Player):
         if self.sight is not None:
             for cellview in self.sight:
                 self.visited_cells.add((cellview.x, cellview.y))
+                self.last_seen[(cellview.x, cellview.y)] = self.current_turn
 
         # Update ark state if at ark
         if snapshot.ark_view is not None:
@@ -499,13 +664,9 @@ class Player8(Player):
     def _update_target_if_needed(self):
         """Update target position if we've reached it or are at ark."""
         if self.is_in_ark():
-            self.target_position = self.sector_manager.get_random_position_in_sector(
-                self.visited_cells
-            )
+            self._set_next_target()
         elif self._has_reached_target():
-            self.target_position = self.sector_manager.get_random_position_in_sector(
-                self.visited_cells
-            )
+            self._set_next_target()
 
     def get_action(self, messages: list[Message]) -> Action | None:
         """Get next action based on current state and messages."""
