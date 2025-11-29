@@ -156,9 +156,9 @@ def run_benchmarks_parallel(maps_dir: pathlib.Path, num_workers: int = None) -> 
                     file=sys.stdout,
                 )
 
-                # Use imap_unordered and manually update progress bar
+                # Use imap and manually update progress bar
                 results = []
-                iterator = pool.imap_unordered(run_single_benchmark, map_files)
+                iterator = pool.imap(run_single_benchmark, map_files)
                 try:
                     for result in iterator:
                         results.append(result)
@@ -170,7 +170,7 @@ def run_benchmarks_parallel(maps_dir: pathlib.Path, num_workers: int = None) -> 
             with Pool(processes=num_workers) as pool:
                 results = []
                 for i, result in enumerate(
-                    pool.imap_unordered(run_single_benchmark, map_files), 1
+                    pool.imap(run_single_benchmark, map_files), 1
                 ):
                     results.append(result)
                     elapsed = time.time() - start_time
@@ -182,9 +182,7 @@ def run_benchmarks_parallel(maps_dir: pathlib.Path, num_workers: int = None) -> 
         # tqdm not available, use simple progress updates
         with Pool(processes=num_workers) as pool:
             results = []
-            for i, result in enumerate(
-                pool.imap_unordered(run_single_benchmark, map_files), 1
-            ):
+            for i, result in enumerate(pool.imap(run_single_benchmark, map_files), 1):
                 results.append(result)
                 elapsed = time.time() - start_time
                 print(

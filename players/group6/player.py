@@ -69,7 +69,7 @@ class Player6(Player):
 
         if kind == Kind.Helper:
             self._patrol_spacing = 10
-            self._initialize_global_patrol_strips(num_helpers)
+            # Don't initialize strips here - do it after we know ark position
             strip_index = self._claim_patrol_strip(id, num_helpers)
             self._setup_patrol_parameters(id, strip_index)
 
@@ -78,33 +78,83 @@ class Player6(Player):
         if len(_PATROL_STRIPS) > 0:
             return
 
-        cols_per_helper = max(1, int(math.ceil(GRID_WIDTH / max(1, num_helpers))))
-        num_strips = int(math.ceil(GRID_WIDTH / cols_per_helper))
+        # Distribute helpers above/below ark based on ark position
+        ark_y = self.ark_position[1]
+        helpers_above = max(1, int(round(num_helpers * ark_y / GRID_HEIGHT)))
+        helpers_below = num_helpers - helpers_above
 
-        for si in range(num_strips):
-            x_min = int(si * cols_per_helper)
-            x_max = int(min(GRID_WIDTH - 1, (si + 1) * cols_per_helper - 1))
-            owner = si if si < num_helpers else None
+        # Create strips for helpers above ark (cover full width, top region)
+        for i in range(helpers_above):
             _PATROL_STRIPS.append(
-                {"x_min": x_min, "x_max": x_max, "owner": owner, "done": False}
+                {
+                    "x_min": 0,
+                    "x_max": GRID_WIDTH - 1,
+                    "owner": i,
+                    "done": False,
+                    "region": "above",
+                }
+            )
+
+        # Create strips for helpers below ark (cover full width, bottom region)
+        for i in range(helpers_below):
+            _PATROL_STRIPS.append(
+                {
+                    "x_min": 0,
+                    "x_max": GRID_WIDTH - 1,
+                    "owner": helpers_above + i,
+                    "done": False,
+                    "region": "below",
+                }
             )
 
     def _claim_patrol_strip(self, helper_id: int, num_helpers: int) -> int:
         global _PATROL_STRIPS
+
+        # Initialize strips if not done yet
+        if len(_PATROL_STRIPS) == 0:
+            self._initialize_global_patrol_strips(num_helpers)
+
         for i, strip in enumerate(_PATROL_STRIPS):
             if strip["owner"] == helper_id:
                 return i
-        strip_index = helper_id % len(_PATROL_STRIPS)
-        _PATROL_STRIPS[strip_index]["owner"] = helper_id
-        return strip_index
+
+        # Shouldn't reach here since strips are pre-assigned
+        return helper_id % len(_PATROL_STRIPS)
 
     def _setup_patrol_parameters(self, helper_id: int, strip_index: int) -> None:
         strip = _PATROL_STRIPS[strip_index]
         self._patrol_strip_index = strip_index
         self._patrol_x_min = strip["x_min"]
         self._patrol_x_max = strip["x_max"]
-        self._patrol_row = (helper_id * self._patrol_spacing) % GRID_HEIGHT
-        self._patrol_row_step = self._patrol_spacing
+
+        # Determine patrol region and starting row based on strip region
+        ark_y = self.ark_position[1]
+
+        if strip.get("region") == "above":
+            # Patrol from top toward ark
+            # Distribute starting rows within the top region
+            helpers_above = sum(1 for s in _PATROL_STRIPS if s.get("region") == "above")
+            helper_index_in_region = helper_id  # Already 0-indexed for this region
+            rows_in_region = max(1, ark_y)
+            row_spacing = max(1, rows_in_region // max(1, helpers_above))
+            self._patrol_row = (helper_index_in_region * row_spacing) % rows_in_region
+            self._patrol_row_step = self._patrol_spacing
+            self._patrol_max_row = ark_y
+        else:  # region == "below"
+            # Patrol from ark toward bottom
+            helpers_above = sum(1 for s in _PATROL_STRIPS if s.get("region") == "above")
+            helper_index_in_region = helper_id - helpers_above
+            bottom_space = GRID_HEIGHT - ark_y
+            rows_in_region = max(1, bottom_space)
+            row_spacing = max(
+                1, rows_in_region // max(1, len(_PATROL_STRIPS) - helpers_above)
+            )
+            self._patrol_row = (
+                ark_y + (helper_index_in_region * row_spacing) % rows_in_region
+            )
+            self._patrol_row_step = self._patrol_spacing
+            self._patrol_max_row = GRID_HEIGHT
+
         self._patrol_dir = helper_id % 2 == 0
         self._patrol_active = True
 
@@ -384,7 +434,36 @@ class Player6(Player):
     def _get_unclaimed_animals(self, animals: set[Animal]) -> set[Animal]:
         global animals_in_flocks, animals_being_chased
         free_animals = animals - animals_in_flocks
-        return {a for a in free_animals if a not in animals_being_chased}
+        unclaimed = {a for a in free_animals if a not in animals_being_chased}
+
+        # Filter out animals we already have pairs of on the ark
+        my_snapshot = helper_snapshots.get(self.id)
+        if my_snapshot and my_snapshot.ark_view:
+            ark_animals = my_snapshot.ark_view.animals
+            species_on_ark = {}
+            for ark_animal in ark_animals:
+                if ark_animal.species_id not in species_on_ark:
+                    species_on_ark[ark_animal.species_id] = {
+                        "male": False,
+                        "female": False,
+                    }
+                if ark_animal.gender == Gender.Male:
+                    species_on_ark[ark_animal.species_id]["male"] = True
+                elif ark_animal.gender == Gender.Female:
+                    species_on_ark[ark_animal.species_id]["female"] = True
+
+            # Only keep animals whose species doesn't have both genders on ark
+            unclaimed = {
+                a
+                for a in unclaimed
+                if a.species_id not in species_on_ark
+                or not (
+                    species_on_ark[a.species_id]["male"]
+                    and species_on_ark[a.species_id]["female"]
+                )
+            }
+
+        return unclaimed
 
     def _try_chase_nearby_animal(self) -> Move | None:
         """Try to chase the closest unclaimed animal in sight."""
@@ -492,7 +571,7 @@ class Player6(Player):
         """Advance patrol to next row, or reassign to new strip if finished."""
         next_row = self._patrol_row + self._patrol_row_step
 
-        if next_row >= GRID_HEIGHT:
+        if next_row >= self._patrol_max_row:
             self._finish_current_strip()
             self._try_reassign_to_unfinished_strip()
         else:
@@ -526,7 +605,16 @@ class Player6(Player):
         self._patrol_strip_index = strip_index
         self._patrol_x_min = strip["x_min"]
         self._patrol_x_max = strip["x_max"]
-        self._patrol_row = 0
+
+        # Set patrol boundaries based on region
+        ark_y = self.ark_position[1]
+        if strip.get("region") == "above":
+            self._patrol_row = 0
+            self._patrol_max_row = ark_y
+        else:
+            self._patrol_row = ark_y
+            self._patrol_max_row = GRID_HEIGHT
+
         self._patrol_dir = strip_index % 2 == 0
         self._patrol_active = True
 

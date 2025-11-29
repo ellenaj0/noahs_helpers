@@ -1,12 +1,12 @@
 import math
 from random import choice, random
-from core.animal import Animal, Gender
+from core.animal import Animal
 from core.message import Message
 from core.player import Player
 from core.snapshots import HelperSurroundingsSnapshot
 from core.views.cell_view import CellView
 from core.views.player_view import Kind
-from core.action import Action, Move, Obtain, Release
+from core.action import Action, Move, Obtain
 import core.constants as c
 
 
@@ -28,21 +28,13 @@ class Player3(Player):
         self.ark_species: set[Animal] = set()
         self.is_raining = False
         self.hellos_received = []
-        # self.angle = math.radians(random() * 360)
-        samples, total_weight = self.angle_weights()
-        self.angle = self.find_angle(samples, total_weight)
-        self.cooldowns = {}
+        self.angle = math.radians(random() * 360)
 
     def check_surroundings(self, snapshot: HelperSurroundingsSnapshot) -> int:
         self.position = snapshot.position
         self.flock = snapshot.flock
-        self.update_ark_memory(snapshot)
-        for animal_id, cooldown in self.cooldowns.items():
-            if cooldown > 0:
-                self.cooldowns[animal_id] = cooldown - 1
-        for animal_id in list(self.cooldowns.keys()):
-            if self.cooldowns[animal_id] == 0:
-                del self.cooldowns[animal_id]
+        if snapshot.ark_view:
+            self.ark_species.update(snapshot.flock)
 
         self.sight = snapshot.sight
         self.is_raining = snapshot.is_raining
@@ -76,15 +68,6 @@ class Player3(Player):
         if self.is_raining:
             return Move(*self.move_towards(*self.ark_position))
 
-        # If I am holding an animal that exists in my ark memory, drop it and add a cooldown
-        ark_memory_info = set()
-        for animal in self.ark_species or []:
-            ark_memory_info.add((animal.species_id, animal.gender))
-        for animal in self.flock:
-            if (animal.species_id, animal.gender) in ark_memory_info:
-                self.cooldowns[animal.species_id] = 20  # e.g., 5 turns cooldown
-                return Release(animal)  # Drop the animal
-
         # if self.is_flock_full():
         #     return Move(*self.move_towards(*self.ark_position))
 
@@ -116,7 +99,7 @@ class Player3(Player):
             return Obtain(animal_to_obtain)
 
         # If I see any animals, I'll chase the closest one
-        closest_animal = self._find_closest_desirable_animal()
+        closest_animal = self._find_closest_animal()
         if closest_animal:
             dist_animal = distance(*self.position, *closest_animal)
             if dist_animal > 0.01 and dist_animal <= 3:
@@ -138,7 +121,7 @@ class Player3(Player):
 
         return self.sight.get_cellview_at(xcell, ycell)
 
-    def _find_closest_desirable_animal(self) -> tuple[int, int] | None:
+    def _find_closest_animal(self) -> tuple[int, int] | None:
         closest_animal = None
         closest_dist = -1
         closest_pos = None
@@ -148,18 +131,7 @@ class Player3(Player):
             ):
                 dist = distance(*self.position, cellview.x, cellview.y)
                 if closest_animal is None or dist < closest_dist:
-                    desirable_animals = []
-                    for animal in cellview.animals:
-                        if self.should_pursue_animal(animal):  # type: ignore
-                            desirable_animals.append(animal)
-                        else:
-                            print(
-                                f"Not pursuing animal {animal.species_id} as both genders are already in ark."
-                            )
-                    # closest_animal = choice(tuple(cellview.animals))
-                    if len(desirable_animals) == 0:
-                        continue
-                    closest_animal = choice(tuple(desirable_animals))
+                    closest_animal = choice(tuple(cellview.animals))
                     closest_dist = dist
                     closest_pos = (cellview.x, cellview.y)
 
@@ -214,7 +186,6 @@ class Player3(Player):
         1. Are not already in the ark
         2. Are not in my own flock
         3. Are not in a cell with other helpers (likely in their flock)
-        4. Are not on cooldown from being recently dropped
 
         Args:
             cellview: The cell to check
@@ -225,99 +196,10 @@ class Player3(Player):
         if self.is_animal_likely_in_flock(cellview):
             return set()
 
-        # Filter out animals already in ark or in my flock and those on cooldown
+        # Filter out animals already in ark or in my flock
         free_animals = set()
         for animal in cellview.animals:
             if animal not in self.ark_species and animal not in self.flock:
-                if animal.species_id not in self.cooldowns:
-                    free_animals.add(animal)
-                else:
-                    print(f"Animal {animal.species_id} skipped: on cooldown.")
+                free_animals.add(animal)
 
         return free_animals
-
-    def update_ark_memory(self, snapshot: HelperSurroundingsSnapshot) -> None:
-        """Update our memory of animals on the ark"""
-        # If no ark view, do nothing
-        if snapshot.ark_view is None:
-            return None
-
-        # Update memory
-        self.ark_species = snapshot.ark_view.animals.copy()
-        # print(f"Ark memory updated: {len(self.ark_species)} animals remembered.")
-
-    def should_pursue_animal(self, animal: Animal) -> bool:
-        """Decide whether to pursue a given animal based on whether it is already in the ark."""
-        ark_animals_with_gender: set[tuple[int, Gender]] = set()
-        for animal in self.ark_species or []:
-            ark_animals_with_gender.add((animal.species_id, animal.gender))
-
-        if (animal.species_id, Gender.Male) in ark_animals_with_gender and (
-            animal.species_id,
-            Gender.Female,
-        ) in ark_animals_with_gender:
-            return False  # Both
-        if animal.species_id in self.cooldowns:
-            print(f"Animal {animal.species_id} skipped: on cooldown.")
-            return False  # On cooldown
-        return True
-
-    def angle_weights(self):
-        num_samples = 360
-        samples = []
-        cumu = 0.0
-        for i in range(0, num_samples):
-            theta = 2 * math.pi * i / num_samples
-            d = self.max_distance_to_boundary(theta)
-            cumu = cumu + d
-            samples.append((theta, cumu))
-        tot_wt = cumu
-        return samples, tot_wt
-
-    def max_distance_to_boundary(self, theta):
-        ark_x = self.ark_position[0]
-        ark_y = self.ark_position[1]
-        dx = math.cos(theta)
-        dy = math.sin(theta)
-
-        t_list = []
-        if dx > 0:
-            t_right = (c.X - ark_x) / dx
-            t_list.append(t_right)
-        elif dx < 0:
-            t_left = (0 - ark_x) / dx
-            t_list.append(t_left)
-
-        if dy > 0:
-            t_top = (c.Y - ark_y) / dy
-            t_list.append(t_top)
-        elif dy < 0:
-            t_bottom = (0 - ark_y) / dy
-            t_list.append(t_bottom)
-
-        if len(t_list) == 0:
-            return 0
-        return min(min(t_list), 1008)
-
-    def find_angle_for_target(self, samples, target):
-        left = 0
-        right = len(samples) - 1
-        while left < right:
-            mid = (left + right) // 2
-            if samples[mid][1] >= target:
-                right = mid
-            else:
-                left = mid + 1
-
-        return samples[left][0]
-
-    def find_angle(self, samples, total_weight):
-        if self.kind == Kind.Noah:
-            return -100
-        k = self.id - 1
-        print(k)
-        target = total_weight * ((float(k) + 0.5) / float(self.num_helpers - 1))
-        print(target)
-        theta = self.find_angle_for_target(samples, target)
-        print(theta)
-        return theta

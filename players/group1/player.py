@@ -11,6 +11,10 @@ from core.views.cell_view import CellView
 from core.animal import Animal, Gender
 from core import constants
 
+from .search_area import equal_area_angles, random_point_in_segment
+
+W, H = 1000, 1000
+
 
 def distance(x1: float, y1: float, x2: float, y2: float) -> float:
     return (abs(x1 - x2) ** 2 + abs(y1 - y2) ** 2) ** 0.5
@@ -27,7 +31,6 @@ class Player1(Player):
         species_populations: dict[str, int],
     ):
         super().__init__(id, ark_x, ark_y, kind, num_helpers, species_populations)
-        print(f"I am {self}")
 
         self.is_raining = False
         self.escaping_wall: bool = False
@@ -42,6 +45,21 @@ class Player1(Player):
         self.target_animal: Animal | None = None
         self.turns_chasing_target = 0
         self.max_chase_turns = 5
+        if self.id == 0:
+            return
+        out = equal_area_angles(ark_x, ark_y, num_helpers - 1)
+        if self.id == 1:
+            self.begin_angle = 0.0
+            self.end_angle = out[0]
+        elif self.id == num_helpers - 1:
+            self.begin_angle = out[-1]
+            self.end_angle = 2 * pi
+        else:
+            self.begin_angle = out[id - 2]
+            self.end_angle = out[id - 1]
+        print(self.begin_angle, self.end_angle)
+        self.visited = set[tuple[int, int]]
+        self.target_pos = (ark_x, ark_y)
 
     def _get_my_cell(self) -> CellView:
         xcell, ycell = tuple(map(int, self.position))
@@ -64,6 +82,7 @@ class Player1(Player):
         self.last_ark_visit_turn = self.current_turn
 
     def _is_animal_needed(self, species, gender) -> bool:
+        # Check other helper memories
         for animals in self.ark_memory:
             if animals == species and gender in self.ark_memory[animals]:
                 print(f"{self.id} does not need {animals} SHOULD MOVE ON")
@@ -236,6 +255,17 @@ class Player1(Player):
         self.base_explore_dir = (math.cos(final_angle), math.sin(final_angle))
         return self.base_explore_dir
 
+    # A sort-of random walk. But it's not working 100%
+    def _meander_in_segment(self) -> tuple[float, float]:
+        current_pos = self.position
+        if current_pos == self.target_pos:
+            print(f"{self.id} meandered to {current_pos}...")
+            self.target_pos = random_point_in_segment(
+                current_pos[0], current_pos[1], self.begin_angle, self.end_angle
+            )
+            print(f"{self.id} will now meander to {self.target_pos}...")
+        return self.target_pos
+
     def _get_angled_move(self) -> tuple[float, float]:
         dir_x, dir_y = self._get_move_direction()
 
@@ -291,7 +321,9 @@ class Player1(Player):
         if self.escaping_wall:
             return Move(*self.move_towards(*self.ark_position))
         if self._is_near_wall():
-            print(f"{self.id} near wall, initiating escape")
+            print(
+                f"{self.id} near wall, initiating escape"
+            )  # just reflect off the wall
             self.escaping_wall = True
             return Move(*self.move_towards(*self.ark_position))
 
@@ -309,6 +341,7 @@ class Player1(Player):
                     self.seen_animals.add(id(best_animal))
                     self.target_animal = None
                     self.turns_chasing_target = 0
+                    new_x, new_y = self._meander_in_segment()
                     return Move(*self._get_angled_move())
 
                 best_animal_pos = self._find_animal_position(best_animal)
@@ -332,7 +365,5 @@ class Player1(Player):
                 self.target_animal = None
                 self.turns_chasing_target = 0
 
-            new_x, new_y = self._get_angled_move()
-            if self.id == 6:
-                print(f"{self.id} exploring to ({new_x:.2f}, {new_y:.2f})")
-            return Move(new_x, new_y)
+            new_pos = self._meander_in_segment()
+            return Move(*self.move_towards(new_pos[0], new_pos[1]))

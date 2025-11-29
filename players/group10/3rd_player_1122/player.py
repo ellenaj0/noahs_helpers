@@ -7,6 +7,12 @@ from core.animal import Gender
 from math import cos, sin, radians, hypot, ceil
 import core.constants as c
 
+from shapely.geometry import Point, Polygon
+
+from shapely.plotting import (
+    plot_polygon,
+)  # Available in shapely >= 2.1
+
 
 class IndependentPlayer(Player):
     """
@@ -36,7 +42,8 @@ class IndependentPlayer(Player):
     ):
         # print(f"Independent Helper {id}")
         super().__init__(id, ark_x, ark_y, kind, num_helpers, species_populations)
-
+        self.h = 1000
+        self.w = 1000
         # State tracking
         self.state = (
             "exploring"  # "exploring", "returning", "hunting", "returning_to_discovery"
@@ -46,6 +53,7 @@ class IndependentPlayer(Player):
         self.current_snapshot = None
         self.forced_return = False
         self.rain_start_turn: int | None = None
+        self.flock_limit: int = 2
 
         # Animal hunting state
         self.discovery_position = None  # Position where we discovered the animal
@@ -57,15 +65,97 @@ class IndependentPlayer(Player):
         )
         self.turns_since_last_hunt = 999  # Turns since last hunt
 
-        # Sector assignment: divide 360 degrees evenly among helpers
-        sector_size = 360.0 / num_helpers
-        self.sector_start = id * sector_size
-        self.sector_end = (id + 1) * sector_size
+        # Track consecutive edge hits (to detect stuck in corner scenarios)
+        self.consecutive_edge_hits = 0  # Number of consecutive times hit edge
 
-        # Initial heading: Helper i starts with heading angle = i * (360/n)
-        # According to algorithm: "Helper i starts with the heading angle = i * (360/n)"
-        self.current_target_angle = id * sector_size
-        self.explored_angles.append(self.current_target_angle)
+        # Sector assignment: divide 360 degrees among helpers (excluding Noah)
+        # with soft weighting based on ark position
+        # Noah is id=0, real helpers are id=1, 2, ..., num_helpers-1
+        num_actual_helpers = num_helpers - 1
+
+        # Make polygon of safe area
+        square = Polygon([(0, 0), (self.w, 0), (self.w, self.h), (0, self.h)])
+
+        # Circle centered at (cx,cy) radius r
+        circle = Point(*self.ark_position).buffer(1008, resolution=256)
+
+        self.inter = square.intersection(circle)
+
+        self.sector_start = id * 360 / num_actual_helpers
+        self.sector_end = (id + 1) * 360 / num_actual_helpers
+        self.current_target_angle = (self.sector_start + self.sector_end) / 2
+        self.explored_angles = [self.current_target_angle]
+
+        # For Noah (id=0), no sector assignment needed
+        if id == 0:
+            self.sector_start = 0
+            self.sector_end = 0
+            self.current_target_angle = 0
+            self.explored_angles = []
+
+        else:
+            # Calculate weighted sector sizes based on explorable area in each direction
+
+            # Calculate area to split
+
+            eq_area = self.inter.area / (num_actual_helpers)
+
+            sector_boundaries = [0]
+
+            # binary seach section of exact size
+            for i in range(id):
+                max_iter = 0
+                high = sector_boundaries[-1] + 360 / num_actual_helpers
+                low = sector_boundaries[-1]
+                temp_low = sector_boundaries[-1]
+
+                while self.wedge_area(low, high, self.inter) < eq_area and high <= 360:
+                    high += high - low
+
+                high = min(high, 360)
+
+                val = -1
+
+                while True:
+                    mid = (high + temp_low) / 2
+                    val = self.wedge_area(low, mid, self.inter)
+
+                    if abs(eq_area - val) < 1e-5 or max_iter > 20:
+                        sector_boundaries += [mid]
+                        if i == id - 1:
+                            helper_index = id - 1
+
+                            self.sector_start = sector_boundaries[helper_index] % 360
+                            self.sector_end = sector_boundaries[helper_index + 1] % 360
+
+                            # Initial heading: center of assigned sector
+
+                            self.current_target_angle = (
+                                self.sector_start + self.sector_end
+                            ) / 2
+                            self.explored_angles.append(self.current_target_angle)
+
+                        break
+                    elif val > eq_area:
+                        high = mid
+                    else:
+                        temp_low = mid
+
+                    max_iter += 1
+
+            # print(sector_boundaries)
+            # Assign sector to this helper
+
+            print(
+                "Helper",
+                id,
+                " ",
+                self.wedge_area(self.sector_start, self.sector_end, self.inter, False),
+                self.sector_start,
+                self.sector_end,
+            )
+        # Track explored directions (both outbound and return paths)
+        self.explored_return_angles = []  # Return path angles
 
         # Track what's on the ark
         self.ark_animals = set(
@@ -74,11 +164,41 @@ class IndependentPlayer(Player):
         self.local_ark_version = type(self).shared_ark_version
 
         # Safety margin: return this many turns before the end
-        self.safety_margin = 100
+        # Increased to 200 for more reliable returns with 20 helpers
+        self.safety_margin = 10
 
         # For Noah, just stay still
         if kind == Kind.Noah:
             self.state = "at_ark"
+
+    def wedge_area(self, theta_start, theta_end, shape, plot=False, length=2000):
+        if theta_end - theta_start > 360:
+            return shape.area
+        (cx, cy) = self.ark_position
+        p0 = (cx, cy)
+        # Endpoint along theta_start
+        p1 = (
+            cx + length * cos(radians(theta_start)),
+            cy + length * sin(radians(theta_start)),
+        )
+
+        # Endpoint along theta_end
+        p2 = (
+            cx + length * cos(radians(theta_end)),
+            cy + length * sin(radians(theta_end)),
+        )
+
+        mid = (theta_start + theta_end) / 2
+
+        p3 = (cx + length * cos(radians(mid)), cy + length * sin(radians(mid)))
+
+        triangle = Polygon([p0, p1, p3, p2])
+        wedge = shape.intersection(triangle)
+
+        if plot:
+            plot_polygon(wedge)
+
+        return wedge.area
 
     def check_surroundings(self, snapshot: HelperSurroundingsSnapshot) -> int:
         """Called before get_action to observe surroundings and broadcast message"""
@@ -140,6 +260,34 @@ class IndependentPlayer(Player):
             abs(current_x - self.ark_position[0]) <= c.EPS
             and abs(current_y - self.ark_position[1]) <= c.EPS
         )
+        dist_ark = hypot(
+            current_x - self.ark_position[0], current_y - self.ark_position[1]
+        )
+
+        if self.rain_start_turn and dist_ark > 1008 - (
+            self.current_snapshot.time_elapsed - self.rain_start_turn
+        ):
+            print("Too far", self.id, dist_ark)
+
+        # if(self.current_snapshot.is_raining and (current_y !=  self.ark_position[1] or current_x != self.ark_position[0])):
+        #    print(self.id, at_ark, current_x, current_y, self.forced_return)
+
+        # Priority 0 (HIGHEST): If forced to return due to time, override all other behaviors
+        # This ensures all helpers return to ark before deadline
+        if self.forced_return:
+            # Cancel any hunting state
+            if self.state in ("hunting", "returning_to_discovery"):
+                self.state = "returning"
+                self.target_animal_cell = None
+                self.target_species_id = None
+                self.discovery_position = None
+                self.previous_state = None
+
+            # Force returning state
+            self.state = "returning"
+
+            # Immediately return to ark, no other actions
+            return self._return_to_ark(snapshot)
 
         # Priority 1: Release animals that ark already has (to free space)
         if len(self.flock) > 0:
@@ -151,7 +299,10 @@ class IndependentPlayer(Player):
 
         # Priority 2: Try to obtain animals if we're in a cell with animals
         # Skip if we're returning and already have flock (focus on getting back to ark)
-        should_skip_obtain = self.state == "returning" and len(self.flock) > 0
+        # ALSO skip if in returning_to_discovery state (focus on getting back to discovery position)
+        should_skip_obtain = (
+            self.state == "returning" and len(self.flock) > 0
+        ) or self.state == "returning_to_discovery"
 
         if not self.is_flock_full() and not should_skip_obtain:
             # Check if we can see our current cell
@@ -164,12 +315,22 @@ class IndependentPlayer(Player):
                         # Only obtain if:
                         # 1. Gender is known (we're in same cell, so it should be known)
                         # 2. Ark doesn't have this species+gender yet
-                        # 3. We have space
-                        # 4. Animal is not already in our flock (not shepherded)
+                        # 3. Our flock doesn't have this species+gender yet (avoid duplicates)
+                        # 4. We have space
+                        # 5. Animal is not already in our flock (not shepherded)
+
+                        # Check if flock already has this species+gender
+                        flock_has_this = any(
+                            a.species_id == animal.species_id
+                            and a.gender == animal.gender
+                            for a in self.flock
+                        )
+
                         if (
                             animal.gender != Gender.Unknown
                             and (animal.species_id, animal.gender)
                             not in self.ark_animals
+                            and not flock_has_this
                             and animal not in self.flock
                             and not self.is_flock_full()
                         ):
@@ -183,7 +344,7 @@ class IndependentPlayer(Player):
                     pass
 
         # Check if we have 2 animals (half capacity) and should return
-        if len(self.flock) >= 2:
+        if len(self.flock) >= self.flock_limit:
             self.state = "returning"
 
         # Check if we're at the ark and returning
@@ -191,6 +352,23 @@ class IndependentPlayer(Player):
             # We just arrived at ark, animals are auto-unloaded
             # Ark updates the global list (handled in check_surroundings via ark_view)
             # The helper receives this updated information before its next exploration leg
+
+            # Check if we've collected all animals (all species have both genders)
+            all_species_complete = True
+            for species_id in range(len(self.species_populations)):
+                has_male = (species_id, Gender.Male) in self.ark_animals
+                has_female = (species_id, Gender.Female) in self.ark_animals
+                if not (has_male and has_female):
+                    all_species_complete = False
+                    break
+
+            if all_species_complete:
+                # All animals collected! Stay at ark
+                self.state = "at_ark"
+                self.forced_return = False
+                return None
+
+            # Still need more animals, continue exploring
             # Choose next exploration angle (maximally distant from all previously explored directions)
             self._choose_next_exploration_angle()
             self.forced_return = False
@@ -291,10 +469,13 @@ class IndependentPlayer(Player):
 
                 # If we can't see the target anymore or reached cell without obtaining
                 # Give up hunting after reasonable attempts
-                if not target_found or (
-                    cell_x == self.target_animal_cell[0]
+                at_target_cell = (
+                    self.target_animal_cell is not None
+                    and cell_x == self.target_animal_cell[0]
                     and cell_y == self.target_animal_cell[1]
-                ):
+                )
+
+                if not target_found or at_target_cell:
                     # Record this position to avoid re-hunting nearby soon
                     self.last_hunt_position = (current_x, current_y)
                     self.turns_since_last_hunt = 0
@@ -303,7 +484,7 @@ class IndependentPlayer(Player):
                     self.target_species_id = None
                     self.discovery_position = None
                     # Decide next state based on flock size
-                    if len(self.flock) >= 2 or self.forced_return:
+                    if len(self.flock) >= self.flock_limit or self.forced_return:
                         self.state = "returning"
                     else:
                         self.state = (
@@ -312,8 +493,11 @@ class IndependentPlayer(Player):
                     self.previous_state = None
                     # Fall through to continue with new state
             else:
-                # Lost target, resume previous state
+                # Lost target species ID, resume previous state
+                self.target_animal_cell = None
+                self.discovery_position = None
                 self.state = self.previous_state if self.previous_state else "exploring"
+                self.previous_state = None
 
         # Priority 5: Search for animals in sight (only if not already hunting or returning to discovery)
         # According to algorithm: "On the return path, the helper continues applying
@@ -381,10 +565,18 @@ class IndependentPlayer(Player):
 
         return None
 
+    # near edge
+    def _near_edge(self, x: int, y: int, angle: float) -> float:
+        new_x = x + 2 * cos(radians(angle))
+        new_y = y + 2 * sin(radians(angle))
+
+        if new_x <= 0 or new_x >= self.w or new_y <= 0 or new_y >= self.h:
+            return True
+
     def _explore(self, snapshot: HelperSurroundingsSnapshot) -> Action | None:
         """Explore outward along current heading"""
         # Check if we should return to ark (already checked in get_action, but double-check here)
-        if len(self.flock) >= 2 or self.is_flock_full():
+        if len(self.flock) >= self.flock_limit or self.is_flock_full():
             self.state = "returning"
             return self._return_to_ark(snapshot)
 
@@ -404,14 +596,14 @@ class IndependentPlayer(Player):
         target_y = current_y + distance * sin(radians(self.current_target_angle))
 
         # Check if we would hit the edge of the world
+
         target_x_clamped = max(0, min(c.X - 1, target_x))
         target_y_clamped = max(0, min(c.Y - 1, target_y))
 
         # If clamping changed our target significantly, we hit an edge - return to ark
-        if (
-            abs(target_x - target_x_clamped) > 0.1
-            or abs(target_y - target_y_clamped) > 0.1
-        ):
+        if self._near_edge(target_x, target_y, self.current_target_angle):
+            # Hit edge! Increment counter
+            self.consecutive_edge_hits += 1
             self.state = "returning"
             return self._return_to_ark(snapshot)
 
@@ -430,6 +622,7 @@ class IndependentPlayer(Player):
         if (
             remaining_after_move <= self.safety_margin
             or turns_to_return_from_target + self.safety_margin > remaining_after_move
+            or distance_to_ark >= 1006
         ):
             self.state = "returning"
             self.forced_return = True
@@ -444,17 +637,29 @@ class IndependentPlayer(Player):
         distance_check = distance_to_target_sq * 0.5 <= c.MAX_DISTANCE_KM
 
         if distance_check and 0 <= target_x < c.X and 0 <= target_y < c.Y:
+            # Successfully moving - reset edge hit counter
+            self.consecutive_edge_hits = 0
             return Move(target_x, target_y)
 
         # If we can't move further (edge case), return to ark
         self.state = "returning"
         return self._return_to_ark(snapshot)
 
+    def _dist_to_ark(self, x, y):
+        return hypot(x - self.ark_position[0], y - self.ark_position[1])
+
     def _return_to_ark(self, snapshot: HelperSurroundingsSnapshot) -> Action | None:
-        """Move towards the ark"""
+        """
+        Move towards the ark with a clockwise offset to explore different areas.
+        The offset angle increases with distance (farther = more offset, but stays close).
+        """
         # Use snapshot position, not self.position
         current_x, current_y = snapshot.position
         ark_x, ark_y = self.ark_position
+
+        if self.forced_return:
+            # print(self.id, *self.move_towards(*self.ark_position))
+            return Move(*self.move_towards(*self.ark_position))
 
         # Calculate direction to ark
         dx = ark_x - current_x
@@ -467,23 +672,59 @@ class IndependentPlayer(Player):
 
         # Move towards ark, but limit step size
         step_size = c.MAX_DISTANCE_KM * 0.99
-        if dist <= step_size:
-            target_x, target_y = ark_x, ark_y
+
+        # Add clockwise offset to explore different areas on return
+        # Only apply offset in the initial phase of return (far from ark)
+        # Then switch to direct path to ensure efficient return
+        # NEVER use offset when forced to return (time constraint) - go directly to ark
+        if dist > 100 and not self.forced_return:
+            # Far from ark (>100km) and not forced: apply clockwise offset to explore new areas
+            # Offset formula: min(30°, distance / 15) gives ~1° per 15km, max 30°
+            offset_radians = radians(min(30, dist / 15))
+
+            # Rotate direction vector clockwise by offset_radians
+            # Clockwise rotation: (x, y) -> (x*cos - y*sin, x*sin + y*cos) with negative angle
+            cos_offset = cos(offset_radians)
+            sin_offset = sin(offset_radians)
+
+            # Apply rotation to direction vector (clockwise)
+            dx_rotated = dx * cos_offset + dy * sin_offset
+            dy_rotated = -dx * sin_offset + dy * cos_offset
+
+            # Normalize and scale
+            dist_rotated = hypot(dx_rotated, dy_rotated)
+            scale = step_size / dist_rotated
+            target_x = current_x + dx_rotated * scale
+            target_y = current_y + dy_rotated * scale
+
+            # Record return angle for next exploration planning
+            from math import atan2, degrees
+
+            return_angle = degrees(atan2(dy_rotated, dx_rotated))
+            if return_angle < 0:
+                return_angle += 360
+
+            # Record this return angle
+            if return_angle not in self.explored_return_angles:
+                self.explored_return_angles.append(return_angle)
         else:
-            scale = step_size / dist
-            target_x = current_x + dx * scale
-            target_y = current_y + dy * scale
+            # Close to ark (≤100km): go directly to ark for efficient return
+            if dist <= step_size:
+                target_x, target_y = ark_x, ark_y
+            else:
+                scale = step_size / dist
+                target_x = current_x + dx * scale
+                target_y = current_y + dy * scale
 
         # Check if we can move to target using the same distance formula as can_move_to
-        distance_to_target_sq = (
-            abs(current_x - target_x) ** 2 + abs(current_y - target_y) ** 2
-        )
-        distance_check = distance_to_target_sq * 0.5 <= c.MAX_DISTANCE_KM
+        if self.can_move_to(target_x, target_y) and self._dist_to_ark(
+            target_x, target_y
+        ) < self._get_available_turns(self.current_snapshot):
+            return Move(*self.move_towards(target_x, target_y))
 
-        if distance_check and 0 <= target_x < c.X and 0 <= target_y < c.Y:
-            return Move(target_x, target_y)
-
-        return None
+        # If normal check failed but we're forced to return, try moving directly anyway
+        # Use a smaller step to ensure we can reach ark before deadline
+        return Move(*self.move_towards(*self.ark_position))
 
     def _move_towards_position(
         self, snapshot: HelperSurroundingsSnapshot, target_x: float, target_y: float
@@ -491,45 +732,33 @@ class IndependentPlayer(Player):
         """
         Move towards a specific position (not a cell). Returns a Move action if possible, None otherwise.
         """
-        current_x, current_y = snapshot.position
+        if self._dist_to_ark(target_x, target_y) > self._get_available_turns(snapshot):
+            return Move(*self.move_towards(*self.ark_position))
 
-        # Calculate direction
-        dx = target_x - current_x
-        dy = target_y - current_y
-        dist = hypot(dx, dy)
-
-        if dist == 0:
-            # Already at target position
-            return None
-
-        # Move towards target, but limit step size
-        step_size = c.MAX_DISTANCE_KM * 0.99
-        if dist <= step_size:
-            target_move_x, target_move_y = target_x, target_y
-        else:
-            scale = step_size / dist
-            target_move_x = current_x + dx * scale
-            target_move_y = current_y + dy * scale
-
-        # Check if we can move to target using the same distance formula as can_move_to
-        distance_to_target_sq = (
-            abs(current_x - target_move_x) ** 2 + abs(current_y - target_move_y) ** 2
-        )
-        distance_check = distance_to_target_sq * 0.5 <= c.MAX_DISTANCE_KM
-
-        if distance_check and 0 <= target_move_x < c.X and 0 <= target_move_y < c.Y:
-            return Move(target_move_x, target_move_y)
-
-        return None
+        return Move(*self.move_towards(target_x, target_y))
 
     def _choose_next_exploration_angle(self):
         """
         Choose the next angle to explore in our sector.
         Strategy: select the angle that maximizes the minimum distance to all "obstacles"
-        (explored angles AND sector boundaries).
+        (explored outbound angles, explored return angles, AND sector boundaries).
 
-        Example: sector 0-90, explored [0] -> choose 45 (far from both 0, 90)
+        Special case: If hit edge 2+ times consecutively, choose random direction to escape corners.
+
+        Example: sector 0-90, explored outbound [0], return [10] -> choose ~50 (far from all)
         """
+        # If hit edge twice in a row, use random direction to escape corner
+        if self.consecutive_edge_hits >= 2:
+            import random
+
+            # Random angle from entire 0-360 degree range (not just sector)
+            # This helps escape corners and edges effectively
+            self.current_target_angle = random.random() * 360.0
+            self.explored_angles.append(self.current_target_angle)
+            # Reset counter after choosing random direction
+            self.consecutive_edge_hits = 0
+            return
+
         num_samples = 72  # Sample more candidates for better coverage
         candidates = []
 
@@ -547,13 +776,21 @@ class IndependentPlayer(Player):
         best_min_dist = -1
 
         for candidate in candidates:
-            # Calculate minimum distance to ALL obstacles (explored angles + boundaries)
+            # Calculate minimum distance to ALL obstacles
             min_dist = float("inf")
 
-            # Distance to explored angles
+            # Distance to explored outbound angles
             for explored in self.explored_angles:
                 # Calculate angular distance (accounting for wraparound)
                 dist = abs(candidate - explored)
+                if dist > 180:
+                    dist = 360 - dist
+                min_dist = min(min_dist, dist)
+
+            # Distance to explored return angles
+            for return_angle in self.explored_return_angles:
+                # Calculate angular distance (accounting for wraparound)
+                dist = abs(candidate - return_angle)
                 if dist > 180:
                     dist = 360 - dist
                 min_dist = min(min_dist, dist)
@@ -570,6 +807,10 @@ class IndependentPlayer(Player):
 
         self.current_target_angle = best_angle
         self.explored_angles.append(best_angle)
+
+        # Successfully chose new direction - reset edge hit counter
+        # (will be incremented again if we hit edge on next exploration)
+        self.consecutive_edge_hits = 0
 
     def _find_nearest_needed_animal(
         self, snapshot: HelperSurroundingsSnapshot
@@ -592,6 +833,10 @@ class IndependentPlayer(Player):
         for cell_view in snapshot.sight:
             cell_x, cell_y = cell_view.x, cell_view.y
             is_current_cell = cell_x == current_cell_x and cell_y == current_cell_y
+
+            # Check if there are other helpers in this cell
+            # If yes, Unknown gender animals might be in their flocks
+            has_other_helpers = any(h.id != self.id for h in cell_view.helpers)
 
             # Check if this cell has animals we need
             has_needed_known_animal = False
@@ -616,13 +861,13 @@ class IndependentPlayer(Player):
                     else:
                         # Unknown gender: from distance we can't tell gender
                         # Could be needed, or could be shepherded by another helper
-                        if is_current_cell:
-                            # In same cell but gender still Unknown - likely shepherded
-                            # Skip to avoid hunting already-shepherded animals
+                        if is_current_cell or has_other_helpers:
+                            # In same cell or cell has other helpers - Unknown gender likely shepherded
+                            # Skip to avoid hunting animals in other helpers' flocks
                             pass
                         else:
-                            # Not in same cell - if species is not complete, consider hunting
-                            # We'll find out the actual gender when we get close
+                            # Not in same cell and no other helpers - likely a free animal
+                            # If species is not complete, consider hunting
                             if not (has_male and has_female):
                                 has_needed_unknown_animal = True
 
@@ -695,18 +940,20 @@ class IndependentPlayer(Player):
     def _get_available_turns(self, snapshot: HelperSurroundingsSnapshot) -> int:
         """
         Conservative estimate of turns remaining before the flood deadline.
-        Uses exact countdown once rain has started, otherwise assumes the
-        earliest possible end time (c.MIN_T).
+        Uses exact countdown once rain has started, otherwise assumes plenty of time.
         """
         if snapshot.is_raining and self.rain_start_turn is None:
             self.rain_start_turn = snapshot.time_elapsed
 
         if self.rain_start_turn is not None:
+            # Rain has started - we know exactly how much time remains
             turns_since_rain = snapshot.time_elapsed - self.rain_start_turn
-            return max(0, c.START_RAIN - turns_since_rain)
+            return max(0, 0.99 * (c.START_RAIN - turns_since_rain))
 
-        # Rain has not started yet; assume the simulation could end at MIN_T
-        return max(0, c.MIN_T - snapshot.time_elapsed)
+        # Rain has not started yet - we don't know when T is
+        # Be optimistic and assume we have plenty of time to explore
+        # Return a large number so helpers continue exploring
+        return 10000  # Effectively infinite before rain starts
 
     def _sync_ark_information(self, snapshot: HelperSurroundingsSnapshot) -> None:
         """

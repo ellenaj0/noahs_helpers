@@ -1,6 +1,7 @@
 """Player7: fresh helper redesign with stable pursuit and clear phases."""
 
 from __future__ import annotations
+
 import math
 from collections import deque
 
@@ -13,6 +14,11 @@ import core.constants as c
 
 
 class Player7(Player):
+    _group_last_logged: dict[int, int] = {}  # group_id -> last turn logged
+    _group_first_window_done: dict[
+        int, bool
+    ] = {}  # track per-group first-window completion
+
     def __init__(
         self,
         id: int,
@@ -25,25 +31,7 @@ class Player7(Player):
         super().__init__(id, ark_x, ark_y, kind, num_helpers, species_populations)
 
         # Tunables consolidated into config for easy tuning
-        self.config = {
-            "linger_turns": 3,
-            "block_after_fail": 3,  # Retry failed cells faster
-            "pursuit_hyst": 1.5,
-            "pursuit_lock": 2,
-            "recent_len": 10,
-            "eta_buffer": 10,
-            "recent_bias": 1.3,
-            "swap_threshold": 1.5,
-            "stuck_threshold": 3,
-            "give_up_turns": 7,
-        }
-
-        # Rarity and territory
-        self.rarity = self._compute_rarity()
-        self.territory = self._compute_territory()
-
-        # Linear formation state (optional for coordinated sweeps)
-        self._formation_spacing = c.MAX_SIGHT_KM * 0.8  # Stay within sight
+        self.config = self._init_config()
 
         # State
         self.turn = 0
@@ -73,38 +61,246 @@ class Player7(Player):
         self._stuck = 0
         # Track chase attempts per cell to avoid infinite chasing
         self._chase_attempts: dict[tuple[int, int], int] = {}
-        # Cells we have explicitly decided to ignore (not worth chasing)
-        self._ignored_cells: set[tuple[int, int]] = set()
-        self._prev_flock_size = 0  # Track for failed obtain detection
+        self._prev_flock_size = 0
 
-        # Animals that proved invalid (caught by someone else / unreachable).
-        # Once added here, they are never targeted again.
-        self._ignored_animals: set = set()
-
-        # Messaging: track what others are carrying and claiming
-        self._seen_carrying: dict[tuple[int, int], int] = {}
-        self._claimed: dict[tuple[int, int], int] = {}
-
-        # Communication system from comms_player
+        # Messaging
         self.priorities: set[tuple[int, int]] = set()
         self.messages_sent: set[int] = set()
         self.messages_to_send: list[int] = []
         self.last_seen_ark_animals: set[tuple[int, int]] = set()
+        self._seen_carrying: dict[tuple[int, int], int] = {}
+        self._claimed: dict[tuple[int, int], int] = {}
 
-        # Waiting position near ark for when multiple helpers return
-        # Spread helpers in a circle around ark
-        self._waiting_position = self._compute_waiting_position()
+        # Rarity
+        self.rarity = self._compute_rarity()
+        self.territory = self._compute_territory()
+
+        # Waiting / Formation
+        self._formation_spacing = c.MAX_SIGHT_KM * 0.8
+
+        self.last_rendezvous_turn = 0
+
+    def _init_config(self) -> dict:
+        return {
+            "linger_turns": 3,
+            "block_after_fail": 3,
+            "pursuit_hyst": 1.5,
+            "pursuit_lock": 2,
+            "recent_len": 10,
+            "eta_buffer": 10,
+            "recent_bias": 1.3,
+            "swap_threshold": 1.5,
+            "stuck_threshold": 3,
+            "give_up_turns": 7,
+        }
+
+    def _init_sliding_window(self, num_groups: int):
+        """Initialize sliding window positions and rotation parameters."""
+        self.center_point = (c.X / 2, c.Y / 2)
+
+        # Base number of slots
+        self.num_slots = max(
+            1, min(50, num_groups * 2)
+        )  # use parameter, not self.num_groups
+        self.slot_angles = [
+            2 * math.pi * i / self.num_slots for i in range(self.num_slots)
+        ]
+
+        # Window sizing
+        self.window_half_size = max(20, min(c.X, c.Y) / (2 * num_groups))
+        self.window_radius = min(c.X, c.Y) / 2 - self.window_half_size
+
+        # Rotation state
+        self.slot_index = 0
+        self.last_slot_turn = self.turn
+        self.slot_turns = 50
+
+        # Precompute window centers in a circle
+        cx, cy = self.center_point
+        r = self.window_radius
+        self.precomputed_windows = [
+            (cx + r * math.cos(angle), cy + r * math.sin(angle))
+            for angle in self.slot_angles
+        ]
+        self.window_center = self.precomputed_windows[self.slot_index]
+
+        # Group tracking
+        self.group_helper_ids = []
+        self.in_rendezvous = True
+        self.group_rendezvous_started = True
+        self.rendezvous_interval = 500
+
+    def setup_groups(self, total_helpers):
+        """Compute number of groups, assign helpers and species."""
+        total_animals = sum(self.species_populations.values())
+        groups_by_species = math.ceil(total_animals / 16)
+        groups_by_helpers = math.ceil(total_helpers / 10)
+
+        # Decide number of groups (1 <= num_groups <= total_helpers <= num_slots)
+        self.num_groups = max(1, max(groups_by_species, groups_by_helpers))
+        self.num_groups = min(self.num_groups, total_helpers)
+
+        self._init_sliding_window(self.num_groups)
+
+        # Assign group ID
+        self.group_id = self.id % self.num_groups
+        self.group_helper_ids = [
+            hid
+            for hid in range(total_helpers)
+            if hid % self.num_groups == self.group_id
+        ]
+
+        # Disable rendezvous if group has only one helper
+        if len(self.group_helper_ids) <= 1:
+            self.in_rendezvous = False
+            self.group_rendezvous_started = False
+            self.rendezvous_interval = 0
+
+        # Assign initial slot to group (spread across slot circle)
+        slots_per_group = max(1, self.num_slots // self.num_groups)
+        self.slot_index = min(self.group_id * slots_per_group, self.num_slots - 1)
+        self.window_center = self.precomputed_windows[self.slot_index]
+        self.last_slot_turn = self.turn
+
+        # Assign species responsibility to this group
+        species_list = sorted(self.species_populations.keys())
+        for idx, letter in enumerate(species_list):
+            if idx % self.num_groups == self.group_id:
+                sid = ord(letter) - ord("a")
+                self.priorities.add((sid, 0))
+                self.priorities.add((sid, 1))
+
+        # print(f"[Setup Groups] Helper {self.id} in group {self.group_id}")
+        # print(f"Group members: {self.group_helper_ids}")
+        # print(f"Assigned slot: {self.slot_index}, Window center: {self.window_center}")
+        # print(f"Assigned species: {self.priorities}")
+
+    def _update_window_center(self):
+        """Rotate group to next slot if enough turns passed and not in rendezvous."""
+        if not self.precomputed_windows:
+            return
+
+        if self.in_rendezvous:
+            return
+
+        if (self.turn - self.last_slot_turn) < self.slot_turns:
+            return
+
+        # Rotate to next slot in circle
+        self.slot_index = (self.slot_index + 1) % self.num_slots
+        self.window_center = self.precomputed_windows[self.slot_index]
+        self.last_slot_turn = self.turn
+
+        last_logged = Player7._group_last_logged.get(self.group_id, -1)
+        if last_logged != self.turn:
+            Player7._group_last_logged[self.group_id] = self.turn
+            # print(f"[Group Rotation] Group {self.group_id} moved to slot {self.slot_index}, center {self.window_center}")
+
+    def _move_to_window(self):
+        """Move helper toward current window center if not already close."""
+        if self._dist_to_point(self.window_center) > 5.0:
+            return self._move_to(self.window_center)
+        return None
+
+    def _move_for_rendezvous(self):
+        """
+        Move toward assigned window. Periodic rendezvous starts after
+        the group has reached its first window.
+        """
+        group_id = self.group_id
+        dist_to_center = self._dist_to_point(self.window_center)
+
+        # move to assigned window if not already close
+        if dist_to_center > 5.0:
+            return self._move_to(self.window_center)
+
+        # Mark that this helper has reached its window
+        self.first_window_reached = True
+
+        # Initialize first-window done flag for the group
+        if group_id not in self._group_first_window_done:
+            self._group_first_window_done[group_id] = True
+            self.last_rendezvous_turn = self.turn
+            # print(f"[Group First Window Reached] Group {group_id} at turn {self.turn}")
+
+        # Only start a new rendezvous if interval elapsed
+        if (self.turn - self.last_rendezvous_turn) >= self.rendezvous_interval:
+            if not self.in_rendezvous:
+                self.in_rendezvous = True
+                # print(f"[Rendezvous Start] Group {group_id} starting rendezvous at turn {self.turn}")
+
+        # If currently in rendezvous, move toward window and check for completion
+        if self.in_rendezvous:
+            # Track visible group members
+            visible_group_members = set()
+            for cellview in self.sight:
+                if (
+                    math.hypot(
+                        cellview.x - self.position[0], cellview.y - self.position[1]
+                    )
+                    <= 5.0
+                ):
+                    for helper in cellview.helpers:
+                        if helper.id in self.group_helper_ids:
+                            visible_group_members.add(helper.id)
+            visible_group_members.add(self.id)
+
+            group_ready = visible_group_members >= set(self.group_helper_ids)
+
+            if dist_to_center > 5.0:
+                return self._move_to(self.window_center)
+
+            if group_ready:
+                self.in_rendezvous = False
+                self.last_rendezvous_turn = self.turn
+                # print(f"[Rendezvous Complete] Group {group_id} finished rendezvous at turn {self.turn}")
+
+    def _dist_to_point(self, point):
+        x, y = self.position
+        px, py = point
+        return ((x - px) ** 2 + (y - py) ** 2) ** 0.5
+
+    def _explore_within_window(self):
+        """
+        Explore but constrained to the sliding window.
+        """
+
+        t = self.territory
+
+        # save original territory
+        orig_min_x = t["min_x"]
+        orig_max_x = t["max_x"]
+        orig_min_y = t["min_y"]
+        orig_max_y = t["max_y"]
+
+        # apply window bounds
+        wx, wy = self.window_center
+        half = self.window_half_size
+
+        t["min_x"] = int(max(0, wx - half))
+        t["max_x"] = int(min(c.X - 1, wx + half))
+        t["min_y"] = int(max(0, wy - half))
+        t["max_y"] = int(min(c.Y - 1, wy + half))
+
+        # explore using modified territory window
+        mv = self._explore()
+
+        # restore territory
+        t["min_x"] = orig_min_x
+        t["max_x"] = orig_max_x
+        t["min_y"] = orig_min_y
+        t["max_y"] = orig_max_y
+
+        return mv
 
     def check_surroundings(self, snapshot: HelperSurroundingsSnapshot) -> int:
         self.last_snapshot = snapshot
+        self.sight = snapshot.sight
         self._update_state(snapshot)
 
         # Initialize priorities on first turn
         if self.turn == 1 and self.kind != Kind.Noah:
-            for letter in self.species_populations.keys():
-                sid = ord(letter) - ord("a")
-                self.priorities.add((sid, 0))  # Male
-                self.priorities.add((sid, 1))  # Female
+            self.setup_groups(self.num_helpers - 1)
 
         # Process ark view for communication
         if snapshot.ark_view:
@@ -139,39 +335,48 @@ class Player7(Player):
 
         self._process_messages(messages)
 
-        # Debug summary each turn
-        try:
-            flock_summary = [
-                (a.species_id, getattr(a.gender, "name", str(a.gender)))
-                for a in self.flock
-            ]
-        except Exception:
-            flock_summary = []
-        print(
-            f"[P7] t={self.turn} pos={self.position} flock={flock_summary}, territory={self.territory}"
-        )
+        self._update_window_center()
 
-        # If in ark with empty flock
+        # Move toward the window center if not at it
+
+        if (self.turn - self.last_slot_turn) >= self.slot_turns:
+            mv = self._move_to_window()
+            if mv:
+                return mv
+
+        # Only then do other behavior like pursuit / explore / ark
+
+        # rendezvous movement
+        if self.in_rendezvous:
+            mv = self._move_for_rendezvous()
+            if mv:
+                return mv
+
+        # If in ark with empty flock, leave immediately
         if self.is_in_ark() and len(self.flock) == 0:
-            # Clear behaviors
+            # Clear behaviors and move to territory center
             self._linger_until = 0
             self._tgt_cell = None
             self._stuck = 0
-
-            dist_to_ark = self._dist_to_ark()
-
-            # If raining, calculate urgency
-            if self.is_raining and self._rain_started_at is not None:
-                elapsed = self.time_elapsed - self._rain_started_at
-                left = c.START_RAIN - elapsed
-                turns_to_ark = math.ceil(dist_to_ark / c.MAX_DISTANCE_KM)
-
-                # If time is tight (less than 50 turns buffer), go direct
-                if turns_to_ark + 50 >= left:
-                    return None
-
             t = self.territory
             return self._move_to((t["cx"], t["cy"]))
+
+        if self.is_raining:
+            if not self.is_in_ark():
+                # Calculate distance to ark
+                ark_x, ark_y = self.ark_position
+                curr_x, curr_y = self.position
+                dx = float(ark_x) - curr_x
+                dy = float(ark_y) - curr_y
+                dist = (dx * dx + dy * dy) ** 0.5
+
+                # If within reach, move directly to exact coordinates
+                if dist <= c.MAX_DISTANCE_KM * 0.99:
+                    return Move(float(ark_x), float(ark_y))
+                # Otherwise move towards it
+                return Move(*self.move_towards(float(ark_x), float(ark_y)))
+            # Already in ark, stay put
+            return None
 
         if self._should_return():
             # When returning, prioritize getting to ark
@@ -275,7 +480,7 @@ class Player7(Player):
                     return Release(animal)
             return None
 
-        return self._explore()
+        return self._explore_within_window()
 
     # -------- State & messages --------
 
@@ -396,15 +601,18 @@ class Player7(Player):
                     heapq.heappush(self.messages_to_send, b)
                     self.messages_sent.add(b)
 
-            # Legacy protocol support
-            female = (b >> 5) & 1
-            have = (b >> 6) & 1
-            claiming = (b >> 7) & 1
-            g = Gender.Female if female else Gender.Male
-            if have:
-                self._seen_carrying[(sid, g.value)] = self.turn
-            if claiming:
-                self._claimed[(sid, g.value)] = self.turn
+            # Legacy protocol support:
+            # Only apply for messages that DON'T use the new from_ark/from_local flags.
+            # This avoids misinterpreting our new encoding and corrupting `_claimed`.
+            if not from_ark and not from_local:
+                female = (b >> 5) & 1
+                have = (b >> 6) & 1
+                claiming = (b >> 7) & 1
+                g = Gender.Female if female else Gender.Male
+                if have:
+                    self._seen_carrying[(sid, g.value)] = self.turn
+                if claiming:
+                    self._claimed[(sid, g.value)] = self.turn
 
     # -------- Decision helpers --------
 
@@ -469,29 +677,20 @@ class Player7(Player):
         best_comp = None
         best_comp_val = -1.0
         for a in animals:
-            # Permanently ignored animals (already failed/caught by others)
-            if a in self._ignored_animals:
-                continue
             if a in self.flock:
-                print(f"[P7] best_here skip: in flock sid={a.species_id} g={a.gender}")
                 continue
             # Skip exact species+gender duplicates (we already carry one)
             if any(
                 f.species_id == a.species_id and f.gender == a.gender
                 for f in self.flock
             ):
-                print(
-                    f"[P7] best_here skip: dup type in flock sid={a.species_id} g={a.gender}"
-                )
                 continue
-            # Skip animals already in the ark
+            # Skip animals already in the ark (no extra value)
             if self._is_in_ark(a.species_id, a.gender):
-                print(f"[P7] best_here skip: in ark sid={a.species_id} g={a.gender}")
                 continue
-            # Skip claimed targets from other helpers
-            if (a.species_id, a.gender.value) in self._claimed:
-                print(f"[P7] best_here skip: claimed sid={a.species_id} g={a.gender}")
-                continue
+            # IMPORTANT: do NOT skip just because of `_claimed` here.
+            # If we're physically on the same cell as the animal, it's cheap
+            # to pick it up, even if another helper "claimed" that species+gender.
 
             # Prioritize animals in priority set
             is_priority = (a.species_id, a.gender.value) in self.priorities
@@ -558,22 +757,14 @@ class Player7(Player):
                 continue
             cell_best = -1.0
             for a in cv.animals:
-                if a in self._ignored_animals:
-                    continue
                 # Skip duplicates in flock
                 if any(
                     f.species_id == a.species_id and f.gender == a.gender
                     for f in self.flock
                 ):
-                    print(
-                        f"[P7] completer skip: dup type in flock sid={a.species_id} g={a.gender} at={(cv.x, cv.y)}"
-                    )
                     continue
                 # Skip animals already in the ark
                 if self._is_in_ark(a.species_id, a.gender):
-                    print(
-                        f"[P7] completer skip: in ark sid={a.species_id} g={a.gender} at={(cv.x, cv.y)}"
-                    )
                     continue
                 if self._would_complete(a.species_id, a.gender):
                     cell_best = max(cell_best, self._value(a.species_id, a.gender))
@@ -595,7 +786,6 @@ class Player7(Player):
         # Clean up old chase attempts
         if self.turn % 50 == 0:
             self._chase_attempts.clear()
-            self._ignored_cells.clear()
 
         # Check if we have an active target
         if (
@@ -608,13 +798,6 @@ class Player7(Player):
                 current_flock_size = len(self.flock)
                 if self._prev_flock_size == current_flock_size:
                     # Flock didn't grow - animal likely moved away
-                    # Any animals still reported in that cell are now
-                    # treated as invalid targets for this helper.
-                    for cv in snap.sight:
-                        if (cv.x, cv.y) == self._tgt_cell:
-                            for a in cv.animals:
-                                self._ignored_animals.add(a)
-                            break
                     cell_key = self._tgt_cell
                     self._chase_attempts[cell_key] = (
                         self._chase_attempts.get(cell_key, 0) + 1
@@ -622,8 +805,6 @@ class Player7(Player):
                     # After 2 failed attempts at same cell, block it
                     if self._chase_attempts[cell_key] >= 2:
                         self._blocked[self._tgt_cell] = self.turn + 20
-                        # Also mark this cell as ignored so we don't retarget it
-                        self._ignored_cells.add(self._tgt_cell)
                         self._tgt_cell = None
                         self._last_dist = None
                         self._stuck = 0
@@ -657,8 +838,6 @@ class Player7(Player):
                     self._blocked[self._tgt_cell] = (
                         self.turn + self.config["give_up_turns"]
                     )
-                    # Mark as ignored so we don't immediately reselect it
-                    self._ignored_cells.add(self._tgt_cell)
                     self._tgt_cell = None
                     self._last_dist = None
                     self._stuck = 0
@@ -667,13 +846,8 @@ class Player7(Player):
                     # Continue toward target only if still valuable
                     target_val = 0.0
                     for cv in snap.sight:
-                        num_helpers = len(cv.helpers)
-                        if num_helpers > 0:
-                            continue
                         if (cv.x, cv.y) == self._tgt_cell:
                             for a in cv.animals:
-                                if a in self._ignored_animals:
-                                    continue
                                 if not any(
                                     f.species_id == a.species_id
                                     and f.gender == a.gender
@@ -701,48 +875,25 @@ class Player7(Player):
             tx, ty = cv.x, cv.y
             if (tx, ty) == curr:
                 continue
-
-            num_helpers = len(cv.helpers)
-            if num_helpers > 0:
-                continue
-
-            # Skip cells we've explicitly decided to ignore
-            if (tx, ty) in self._ignored_cells:
-                print(f"[P7] pursue skip ignored cell={(tx, ty)}")
-                continue
             exp = self._blocked.get((tx, ty))
             if exp is not None and exp > self.turn:
                 continue
 
             # Evaluate each animal in this cell
             for a in cv.animals:
-                if a in self._ignored_animals:
-                    continue
                 if any(
                     f.species_id == a.species_id and f.gender == a.gender
                     for f in self.flock
                 ):
-                    print(
-                        f"[P7] pursue skip: dup type in flock sid={a.species_id} g={a.gender} at={(tx, ty)}"
-                    )
                     continue
                 # Skip animals already in the ark
                 if self._is_in_ark(a.species_id, a.gender):
-                    print(
-                        f"[P7] pursue skip: in ark sid={a.species_id} g={a.gender} at={(tx, ty)}"
-                    )
                     continue
                 if (a.species_id, a.gender.value) in self._claimed:
-                    print(
-                        f"[P7] pursue skip: claimed sid={a.species_id} g={a.gender} at={(tx, ty)}"
-                    )
                     continue
 
                 animal_val = self._value(a.species_id, a.gender)
                 if animal_val <= 0:
-                    print(
-                        f"[P7] pursue skip: low value={animal_val} sid={a.species_id} g={a.gender} at={(tx, ty)}"
-                    )
                     continue
 
                 dx = tx - self.position[0]
@@ -765,25 +916,14 @@ class Player7(Player):
                     best_score = score
                     best_cell = (tx, ty)
 
-        if best_cell is not None:
-            print(
-                f"[P7] pursue best_cell={best_cell} best_score={best_score} pos={self.position}"
-            )
-
         if best_cell is None:
             # No valuable cells, clear history
             if len(self._recent) > 5:
                 self._recent.clear()
             return None
 
-        # If the best score is too low, treat this as a conscious decision
-        # to not chase anything right now and continue exploration instead.
+        # Pursue any positive value target (be more aggressive)
         if best_score < 1:
-            if best_cell is not None:
-                print(
-                    f"[P7] pursue ignore low-score cell={best_cell} score={best_score}"
-                )
-                self._ignored_cells.add(best_cell)
             return None
 
         # Set new target
@@ -795,34 +935,19 @@ class Player7(Player):
         dy = best_cell[1] - self.position[1]
         self._last_dist = max(0.0, math.hypot(dx, dy))
         self._stuck = 0
-        print(f"[P7] pursue set target cell={best_cell} score={best_score}")
         return self._move_to(best_cell)
 
     # -------- Scoring --------
 
     def _is_in_ark(self, sid: int, gender) -> bool:
-        """Check if this species+gender (or species as a whole) is already in the ark.
-
-        For unknown gender, we treat the species as "in ark" if both genders
-        are already present. This prevents chasing distant animals of a
-        fully-saved species whose gender we cannot yet see.
-        """
+        """Check if this species+gender is already in the ark."""
         from core.animal import Gender
 
+        if gender is None or gender == Gender.Unknown:
+            return False
         info = self.ark_status.get(sid)
         if info is None:
             return False
-
-        # If gender is unknown, species is effectively in the ark only if both
-        # genders have been saved.
-        if gender is None or gender == Gender.Unknown:
-            in_ark = info.get(Gender.Male, False) and info.get(Gender.Female, False)
-            if in_ark:
-                print(
-                    f"[P7] _is_in_ark: skip unknown-gender of fully-saved species sid={sid}"
-                )
-            return in_ark
-
         return info.get(gender, False)
 
     def _would_complete(self, sid: int, gender) -> bool:
@@ -840,37 +965,14 @@ class Player7(Player):
 
         base = self.rarity.get(sid, 1.0)
         info = self.ark_status.get(sid, {Gender.Male: False, Gender.Female: False})
-        has_m = info[Gender.Male]
-        has_f = info[Gender.Female]
-
-        # If we already carry both genders of this species in our own flock,
-        # treat all further animals of this species as worthless, regardless
-        # of their gender. This prevents chasing already-complete species.
-        have_m_in_flock = any(
-            f.species_id == sid and f.gender == Gender.Male for f in self.flock
-        )
-        have_f_in_flock = any(
-            f.species_id == sid and f.gender == Gender.Female for f in self.flock
-        )
-        if have_m_in_flock and have_f_in_flock:
-            return 0.0
-
-        # Unknown gender: decide based on ark completion for this species.
         if gender is None or gender == Gender.Unknown:
-            # Species already fully saved: no value.
-            if has_m and has_f:
-                return 0.0
-            # Species not on ark at all: moderately high value.
-            if not has_m and not has_f:
-                return base * 60
-            # Exactly one gender present: could complete the species.
-            return base * 90
-
+            return base * 50
         # If we already carry this species+gender in flock, make it worthless
         # so pursuit scoring and selection ignore duplicates.
         if any(f.species_id == sid and f.gender == gender for f in self.flock):
             return 0.0
-
+        has_m = info[Gender.Male]
+        has_f = info[Gender.Female]
         if (gender == Gender.Male and has_f and not has_m) or (
             gender == Gender.Female and has_m and not has_f
         ):
@@ -898,19 +1000,29 @@ class Player7(Player):
     # -------- Movement & exploration --------
 
     def _move_to(self, pos: tuple[float, float]) -> Move:
+        # Check if moving to ark position
+        ark_x, ark_y = self.ark_position
+
+        # If target is the ark position
+        if abs(pos[0] - ark_x) < c.EPS and abs(pos[1] - ark_y) < c.EPS:
+            # Calculate if we can reach it
+            curr_x, curr_y = self.position
+            dx = float(ark_x) - curr_x
+            dy = float(ark_y) - curr_y
+            dist = (dx * dx + dy * dy) ** 0.5
+
+            # If within reach, move directly to exact integer coordinates
+            if dist <= c.MAX_DISTANCE_KM * 0.99:
+                return Move(float(ark_x), float(ark_y))
+
+            # Otherwise, move towards it but will eventually reach exact coords
+            next_x, next_y = self.move_towards(float(ark_x), float(ark_y))
+            return Move(next_x, next_y)
+
+        # For non-ark positions, use normal movement
         nx, ny = self.move_towards(pos[0], pos[1])
-        # Clamp to valid field boundaries
         nx = max(0, min(nx, c.X - 1))
         ny = max(0, min(ny, c.Y - 1))
-
-        # When moving toward the ark, snap exactly onto ark position if
-        # we are within EPS. This ensures helpers actually count as being
-        # in the ark at the end of the game.
-        ark_x, ark_y = self.ark_position
-        if abs(nx - ark_x) <= c.EPS and abs(ny - ark_y) <= c.EPS:
-            nx = float(ark_x)
-            ny = float(ark_y)
-
         return Move(nx, ny)
 
     def _explore(self) -> Move:
@@ -1015,25 +1127,6 @@ class Player7(Player):
         return self._move_to((x_tgt, y_tgt))
 
     # -------- Setup helpers --------
-
-    def _compute_waiting_position(self) -> tuple[float, float]:
-        """Compute a waiting position near ark for this helper.
-        Spreads helpers in a circle to avoid crowding."""
-        ark_x, ark_y = self.ark_position
-
-        # Place helpers in a circle around ark
-        # Radius of 3-5km keeps them close but spread out
-        radius = 4.0
-        angle = (2 * math.pi * self.id) / max(1, self.num_helpers)
-
-        wait_x = ark_x + radius * math.cos(angle)
-        wait_y = ark_y + radius * math.sin(angle)
-
-        # Clamp to valid field bounds
-        wait_x = max(0, min(wait_x, c.X - 1))
-        wait_y = max(0, min(wait_y, c.Y - 1))
-
-        return (wait_x, wait_y)
 
     def _compute_rarity(self) -> dict[int, float]:
         if not self.species_populations:

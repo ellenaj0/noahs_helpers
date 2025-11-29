@@ -24,12 +24,14 @@ class Player2(Player):
         species_populations: dict[str, int],
     ):
         super().__init__(id, ark_x, ark_y, kind, num_helpers, species_populations)
-        print(f"I am {self}")
+        # print(f"I am {self}")
 
         self.is_raining = False
         self.hellos_received = []
         self.mode = "waiting"
-        self.direction = (0, 0)
+        # spread out initial direction outward from ark
+        self.direction = (ark_x + randint(-300, 300), ark_y + randint(-300, 300))
+
         self.internal_ark = set()
         self.complete_species = set()
 
@@ -61,16 +63,21 @@ class Player2(Player):
         max_attempts = 100
 
         while attempts < max_attempts:
-            # Pick a random grid cell
             grid_x = randint(0, 9)
             grid_y = randint(0, 9)
 
-            if (grid_x, grid_y) not in self.visited_cells:
-                self.visited_cells.add((grid_x, grid_y))
-                self.current_target_cell = (grid_x, grid_y)
-                return self._get_grid_center(grid_x, grid_y)
+            # Avoid visited cells + same cell we are already moving toward
+            if (grid_x, grid_y) in self.visited_cells or (
+                grid_x,
+                grid_y,
+            ) == self.current_target_cell:
+                attempts += 1
+                continue
 
-            attempts += 1
+            # Valid new target
+            self.visited_cells.add((grid_x, grid_y))
+            self.current_target_cell = (grid_x, grid_y)
+            return self._get_grid_center(grid_x, grid_y)
 
         # If most cells are visited then it's fine and we'll reset to allow revists
         self.visited_cells.clear()
@@ -82,8 +89,8 @@ class Player2(Player):
 
     def _get_grid_cell(self, x: float, y: float) -> tuple[int, int]:
         """Convert a position to the scaled down 10x10 grid cell coordinates"""
-        grid_x = int(x // self.grid_size)
-        grid_y = int(y // self.grid_size)
+        grid_x = max(0, min(9, int(x // self.grid_size)))
+        grid_y = max(0, min(9, int(y // self.grid_size)))
         return (grid_x, grid_y)
 
     def _get_grid_center(self, grid_x: int, grid_y: int) -> tuple[float, float]:

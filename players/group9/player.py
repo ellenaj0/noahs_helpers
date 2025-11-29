@@ -1,68 +1,29 @@
 from __future__ import annotations
 
 import math
-from math import ceil, hypot
+from math import ceil
 from random import random
+import core.constants as c
+from core.animal import Gender
 from typing import Any
 
-import core.constants as c
 from core.action import Action, Move, Obtain, Release
-from core.animal import Gender
 from core.message import Message
 from core.player import Player
 from core.snapshots import HelperSurroundingsSnapshot
+from core.views.cell_view import CellView
 from core.views.player_view import Kind
 
 
 def distance(x1: float, y1: float, x2: float, y2: float) -> float:
-    """Calculates Euclidean distance."""
     return (abs(x1 - x2) ** 2 + abs(y1 - y2) ** 2) ** 0.5
 
 
 class Player9(Player):
-    """
-    Greedy "Cluster-Feed" Strategy with Helper Coordination (v18.4 - Greedy Tweaks):
-
-    - NOAH:
-        - Broadcasts the rarest still-needed species (no male+female pair yet).
-
-    - HELPERS:
-        - Sync ark contents when anyone sees the ark.
-        - Maintain priority:
-            1) Species still needed (no full pair), ordered by rarity.
-            2) Then other species.
-        - Use messages for spatial coordination:
-            * Each helper broadcasts the coarse grid sector it is currently in.
-            * Helpers prefer to chase animals in sectors not already claimed
-              by other helpers.
-
-        - Inventory behavior (now greedier):
-            * While carrying animals (but not full), try to fill flock,
-              as long as there is enough time to get home (dynamic margin).
-            * After returning and unloading, immediately look for nearby
-              animals in sight and go for them if any exist.
-            * Never leave a good animal on the current cell unused.
-            * If no needed species on a cell, grab ANY animal you can.
-
-        - Movement:
-            * All moves go through `_get_safe_move_action`.
-            * If a move is blocked, fall back to random/scatter moves.
-            * When at the Ark and there is time left, try to
-              step away (never get stuck sitting on the Ark).
-            * Anti-ping-pong logic to sweep away from un-obtainable animals.
-            * Smart "wait at ark" logic to prevent wasted steps when
-              time is low.
-    """
-
     FLOCK_CAPACITY = 4
-
-    # Coarse sectors for coordination
-    SECTORS_X = 10
-    SECTORS_Y = 10
-
-    # Shared ark state
-    shared_ark_animals: set[tuple[str, Gender]] = set()
-    shared_ark_version: int = 0
+    # Shared short-lived claims across helpers: {(x,y): (owner_id, ttl)}
+    shared_claims: dict[tuple[int, int], tuple[int, int]] = {}
+    CLAIM_TTL = 6
 
     def __init__(
         self,
@@ -76,29 +37,21 @@ class Player9(Player):
         super().__init__(id, ark_x, ark_y, kind, num_helpers, species_populations)
 
         self.is_raining = False
-        self.rain_start_turn: int | None = None
-        self.forced_return = False
-        self.current_snapshot: HelperSurroundingsSnapshot | None = None
+        self.hellos_received: list[int] = []
+        self.num_helpers = num_helpers
 
+        # Initialize ark_inventory so the linter is happy.
         self.ark_inventory: dict[str, set[str]] = {}
-        self.ark_animals = set(type(self).shared_ark_animals)
-        self.local_ark_version = type(self).shared_ark_version
 
-        # Noah broadcast target
+        # --- Communication and Targeting ---
         self.noah_target_species: str | None = None
 
-        # Sector we think we’re in
-        self.current_sector: int | None = None
-
-        # Rarity info
-        self_species_populations = self.species_populations
+        # Sort species from rarest to commonest
         self.rarity_order = sorted(
-            self_species_populations.keys(),
-            key=lambda s: self_species_populations.get(s, 0),
+            species_populations.keys(), key=lambda s: species_populations.get(s, 0)
         )
-        self.rarity_map = {species: i for i, species in enumerate(self.rarity_order)}
 
-        # Encoding for species <-> int (for Noah messages)
+        # Create a mapping for 1-byte messages
         self.int_to_species: dict[int, str] = {
             i + 1: species for i, species in enumerate(self.rarity_order)
         }
@@ -106,292 +59,100 @@ class Player9(Player):
             species: i for i, species in self.int_to_species.items()
         }
 
-        # Recomputed after ark sync
-        self.personal_priority_species: list[str] = list(self.rarity_order)
-
-        # Simple stuck detection for "spam OBTAIN on same cell" cases
-        self.last_cell: tuple[int, int] | None = None
-        self.last_flock_size: int = 0
-        self.stuck_turns: int = 0
-
-        # Deterministic sweep angle assignment
+        # Each helper gets its own sweep direction (angle) so they fan out.
+        # Use (id-1) to get denser packing and add a small deterministic jitter
         if num_helpers > 0:
-            idx = id % num_helpers
-            self.sweep_angle = 2.0 * math.pi * idx / num_helpers
+            idx = (id - 1) % num_helpers
+            base = float(idx) / float(num_helpers)
+            jitter = ((id * 9973) % 1000) / 1000.0 * 0.05
+            self.sweep_angle = 2.0 * math.pi * ((base + jitter) % 1.0)
         else:
             self.sweep_angle = 0.0
+
+        # Assign roles: 0 = sweeper, 1 = cluster hunter, 2 = ark-runner
+        r = self.id % 3
+        if r == 0:
+            self.role = "sweeper"
+            self.corridor_lookahead = 3.0
+            self.corridor_width = 2.0
+        elif r == 1:
+            self.role = "cluster"
+            self.corridor_lookahead = 0.0
+            self.corridor_width = 3.5
+            self.cluster_radius = 12.0
+        else:
+            self.role = "ark_runner"
+            self.corridor_lookahead = 1.0
+            self.corridor_width = 2.0
+            self.ark_radius = 8.0
+            self.ark_bonus = 10.0
+        # track small local extra-collects (reset at ark)
+        self.local_collects = 0
 
         if self.kind == Kind.Noah:
             print("I am Noah. I will coordinate.")
         else:
             print(f"I am Helper {self.id}. My sweep angle is {self.sweep_angle:.2f}")
-
-    # ---------- Sector Helpers for Coordination ----------
-
-    def _sector_for_position(self, x: float, y: float) -> int:
-        """Map a continuous position to a coarse sector index (0..SECTORS_X*SECTORS_Y-1)."""
-        sx = 0 if c.X <= 0 else int(self.SECTORS_X * x / c.X)
-        sy = 0 if c.Y <= 0 else int(self.SECTORS_Y * y / c.Y)
-
-        sx = max(0, min(self.SECTORS_X - 1, sx))
-        sy = max(0, min(self.SECTORS_Y - 1, sy))
-
-        return sy * self.SECTORS_X + sx
-
-    def _sector_for_cell(self, cell_x: int, cell_y: int) -> int:
-        """Map a grid cell center to a sector index."""
-        return self._sector_for_position(cell_x + 0.5, cell_y + 0.5)
+        # helper state for simple pick-and-return behavior
+        self.stay_turns: int = 0
+        self.last_cell = None
+        self.last_flock_size = 0
+        self.stuck_turns = 0
+        # how many adjacent/local extra collects allowed between ark deliveries
+        self.max_local_collects = 2
+        self.local_collects = 0
+        # zigzag state for sweep movement
+        self.zigzag_phase = False
+        self.zigzag_threshold = 50.0
+        self.zigzag_amplitude = 0.8
 
     # ---------- Core Helper Functions ----------
 
-    def _get_my_cell(self, snapshot: HelperSurroundingsSnapshot) -> Any | None:
+    def _get_my_cell(self) -> CellView:
         xcell, ycell = tuple(map(int, self.position))
-        if not snapshot.sight.cell_is_in_sight(xcell, ycell):
-            return None
-        try:
-            return snapshot.sight.get_cellview_at(xcell, ycell)
-        except Exception:
-            return None
+        if not self.sight.cell_is_in_sight(xcell, ycell):
+            raise Exception(f"{self} failed to find own cell")
+        return self.sight.get_cellview_at(xcell, ycell)
 
-    def _is_at_ark(self, snapshot: HelperSurroundingsSnapshot) -> bool:
-        current_x, current_y = snapshot.position
-        ark_x, ark_y = self.ark_position
-        return int(current_x) == int(ark_x) and int(current_y) == int(ark_y)
-
-    def _get_species_rarity(self, species_id: Any) -> float:
-        return self.rarity_map.get(str(species_id), float("inf"))
-
-    def _species_has_pair(self, species_id_str: str) -> bool:
-        has_male = (species_id_str, Gender.Male) in self.ark_animals
-        has_female = (species_id_str, Gender.Female) in self.ark_animals
-        return has_male and has_female
-
-    def _is_species_needed(self, species_id: Any) -> bool:
-        species_id_str = str(species_id)
-        return not self._species_has_pair(species_id_str)
-
-    # ---------- Coordination & Strategy Logic ----------
-
-    def _recompute_personal_priority(self) -> None:
-        needed = [s for s in self.rarity_order if self._is_species_needed(s)]
-        not_needed = [s for s in self.rarity_order if s not in needed]
-        self.personal_priority_species = needed + not_needed
-
-    def _find_rarest_needed_species(self) -> str | None:
-        for species in self.rarity_order:
-            if self._is_species_needed(species):
-                return species
-        return None
-
-    # 🟢 GREEDIER VERSION
-    def _get_best_animal_on_cell(self, cellview: Any) -> Any | None:
+    # --- Robust "un-stuck" function ---
+    def _get_random_move(self) -> tuple[float, float]:
         """
-        GREEDY:
-        1) Prefer any needed species on this cell.
-        2) If none are needed, grab the first obtainable animal (any species).
-        """
-        if not cellview or not cellview.animals:
-            return None
-
-        # First pass: needed animals
-        for animal in cellview.animals:
-            if animal.gender == Gender.Unknown:
-                continue
-            if animal in self.flock:
-                continue
-            species_id_str = str(animal.species_id)
-            if self._is_species_needed(species_id_str):
-                return animal
-
-        # Second pass: ANY obtainable animal
-        for animal in cellview.animals:
-            if animal.gender == Gender.Unknown:
-                continue
-            if animal in self.flock:
-                continue
-            return animal
-
-        return None
-
-    # 🟢 GREEDIER VERSION
-    def _find_best_animal_to_chase(
-        self,
-        snapshot: HelperSurroundingsSnapshot,
-        avoid_sectors: set[int] | None = None,
-    ) -> tuple[int, int] | None:
-        """
-        GREEDY:
-        Ignore Noah target + rarity.
-        Just:
-          - Pick the closest cell with animals.
-          - If possible, prefer cells in sectors NOT in avoid_sectors.
-        """
-        avoid_sectors = avoid_sectors or set()
-
-        my_x, my_y = int(self.position[0]), int(self.position[1])
-
-        best_non_avoid = None
-        best_non_avoid_dist = float("inf")
-
-        best_any = None
-        best_any_dist = float("inf")
-
-        for cellview in snapshot.sight:
-            if not cellview.animals:
-                continue
-
-            # Skip our own cell; our own cell is handled earlier.
-            if cellview.x == my_x and cellview.y == my_y:
-                continue
-
-            dist = distance(*self.position, cellview.x + 0.5, cellview.y + 0.5)
-            cell_sector = self._sector_for_cell(cellview.x, cellview.y)
-            in_avoid = cell_sector in avoid_sectors
-
-            # Track best overall
-            if dist < best_any_dist:
-                best_any_dist = dist
-                best_any = (cellview.x, cellview.y)
-
-            # Track best NOT in avoid set
-            if not in_avoid and dist < best_non_avoid_dist:
-                best_non_avoid_dist = dist
-                best_non_avoid = (cellview.x, cellview.y)
-
-        # If we found something outside avoid sectors, use that; otherwise, fall back.
-        return best_non_avoid or best_any
-
-    def _get_smart_release(self, cellview: Any) -> Action | None:
-        """
-        If flock is full, see if we can swap a "bad" animal for a better one on this cell.
-        """
-        if not self.is_flock_full() or not cellview or not cellview.animals:
-            return None
-
-        best_on_cell = self._get_best_animal_on_cell(cellview)
-        if not best_on_cell:
-            return None
-
-        best_species_str = str(best_on_cell.species_id)
-        best_needed = self._is_species_needed(best_species_str)
-        best_rarity = self._get_species_rarity(best_species_str)
-
-        if not best_needed:
-            return None
-
-        worst_in_flock = None
-        worst_key = (-1, -1.0)  # (needed_flag, rarity)
-
-        for animal in self.flock:
-            species_str = str(animal.species_id)
-            needed = self._is_species_needed(species_str)
-            rarity = self._get_species_rarity(species_str)
-            needed_flag = 0 if needed else 1
-            key = (needed_flag, rarity)
-            if key > worst_key:
-                worst_key = key
-                worst_in_flock = animal
-
-        if worst_in_flock:
-            worst_species_str = str(worst_in_flock.species_id)
-            worst_needed = self._is_species_needed(worst_species_str)
-            worst_rarity = self._get_species_rarity(worst_species_str)
-
-            if (not worst_needed) or (worst_rarity > best_rarity):
-                print(
-                    f"Helper {self.id} releasing {worst_in_flock.species_id} "
-                    f"for better needed {best_on_cell.species_id}"
-                )
-                return Release(worst_in_flock)
-
-        return None
-
-    # ---------- Movement & Safety ----------
-
-    def _get_random_move(self) -> Action | None:
-        """
-        Robust "un-stuck" move.
-        Tries 10 random moves, then center, then (if not at ark) ark, then waits (None).
+        Tries 10 times to find a valid random move.
+        If it fails, it tries to move to center, then to ark,
+        then stays put. This is to prevent any freezes.
         """
         old_x, old_y = self.position
-        ark_x, ark_y = self.ark_position
 
+        # 1. Try 10 random moves
         for _ in range(10):
             dx, dy = random() - 0.5, random() - 0.5
             new_x, new_y = old_x + dx, old_y + dy
-            if (new_x, new_y) != (old_x, old_y) and self.can_move_to(new_x, new_y):
-                return Move(new_x, new_y)
+            if self.can_move_to(new_x, new_y):
+                return new_x, new_y
 
-        cx, cy = self.move_towards(500.0, 500.0)
-        if (cx, cy) != (old_x, old_y) and self.can_move_to(cx, cy):
-            return Move(cx, cy)
-
-        # --- FIX: Do not try to move to ark if already on ark cell ---
-        is_on_ark_cell = int(old_x) == int(ark_x) and int(old_y) == int(ark_y)
-        if not is_on_ark_cell:
-            ax, ay = self.move_towards(ark_x, ark_y)
-            if (ax, ay) != (old_x, old_y) and self.can_move_to(ax, ay):
-                return Move(ax, ay)
-        # --- END FIX ---
-
-        return None
-
-    def _get_safe_move_action(self, target_x: float, target_y: float) -> Action | None:
-        new_x, new_y = self.move_towards(target_x, target_y)
-
-        new_x = max(0, min(c.X - 1, new_x))
-        new_y = max(0, min(c.Y - 1, new_y))
-
+        # 2. Fallback 1: Try to move to the center
+        new_x, new_y = self.move_towards(500.0, 500.0)
         if self.can_move_to(new_x, new_y):
-            return Move(new_x, new_y)
-        else:
-            return self._get_random_move()
+            return new_x, new_y
 
-    def _move_to_ark(self) -> Action | None:
-        return self._get_safe_move_action(*self.ark_position)
+        # 3. Fallback 2: Try to move to the Ark
+        new_x, new_y = self.move_towards(*self.ark_position)
+        if self.can_move_to(new_x, new_y):
+            return new_x, new_y
 
-    def _move_to_cell(self, cell_x: int, cell_y: int) -> Action | None:
-        return self._get_safe_move_action(cell_x + 0.5, cell_y + 0.5)
+        # 4. Fallback 3: Stay put (absolute last resort)
+        return old_x, old_y
 
-    def _get_sweep_move(self) -> Action | None:
-        current_x, current_y = self.position
+    # ---------- Coordinated Hunting Logic ----------
 
-        dx = math.cos(self.sweep_angle) * c.MAX_DISTANCE_KM * 0.99
-        dy = math.sin(self.sweep_angle) * c.MAX_DISTANCE_KM * 0.99
-
-        target_x = current_x + dx
-        target_y = current_y + dy
-
-        if not (0 <= target_x < c.X):
-            self.sweep_angle = math.pi - self.sweep_angle
-        if not (0 <= target_y < c.Y):
-            self.sweep_angle = -self.sweep_angle
-
-        dx = math.cos(self.sweep_angle) * c.MAX_DISTANCE_KM * 0.99
-        dy = math.sin(self.sweep_angle) * c.MAX_DISTANCE_KM * 0.99
-
-        target_x = current_x + dx
-        target_y = current_y + dy
-
-        target_x = max(0, min(c.X - 1, target_x))
-        target_y = max(0, min(c.Y - 1, target_y))
-
-        if self.can_move_to(target_x, target_y):
-            return Move(target_x, target_y)
-
-        return self._get_random_move()
-
-    # ---------- Time & Ark Sync ----------
-
-    def _get_available_turns(self, snapshot: HelperSurroundingsSnapshot) -> int:
-        if snapshot.is_raining and self.rain_start_turn is None:
-            self.rain_start_turn = snapshot.time_elapsed
-
-        if self.rain_start_turn is not None:
-            turns_since_rain = snapshot.time_elapsed - self.rain_start_turn
-            return max(0, c.START_RAIN - turns_since_rain)
-
-        return max(0, c.MIN_T - snapshot.time_elapsed)
+    def _find_rarest_needed_species(self) -> str | None:
+        """(Noah's logic) Finds the rarest species we don't have 2 of."""
+        for species in self.rarity_order:
+            if species not in self.ark_inventory:
+                return species  # We have none
+            if len(self.ark_inventory.get(species, set())) < 2:
+                return species  # We only have one gender
+        return None  # We have saved all species!
 
     def _roundtrip_safe(
         self,
@@ -400,292 +161,725 @@ class Player9(Player):
         cell_y: int,
         extra_margin: int = 3,
     ) -> bool:
-        """
-        Returns True if we can go from Ark to (cell_x, cell_y) and back
-        before the flood, with an extra safety margin.
-        """
+        # Estimate turns needed to go from ark to cell and back
         dx = (cell_x + 0.5) - self.ark_position[0]
         dy = (cell_y + 0.5) - self.ark_position[1]
-        dist = hypot(dx, dy)
-
+        dist = math.hypot(dx, dy)
         turns_out = ceil(dist / c.MAX_DISTANCE_KM)
-        available_turns = self._get_available_turns(snapshot)
+        available = self._get_available_turns(snapshot)
+        return 2 * turns_out + extra_margin <= available
 
-        return 2 * turns_out + extra_margin <= available_turns
+    def _get_available_turns(self, snapshot: HelperSurroundingsSnapshot) -> int:
+        # Track rain start turn and compute remaining safe turns
+        if snapshot.is_raining and getattr(self, "rain_start_turn", None) is None:
+            self.rain_start_turn = snapshot.time_elapsed
+        if getattr(self, "rain_start_turn", None) is not None:
+            turns_since = snapshot.time_elapsed - self.rain_start_turn
+            return max(0, c.START_RAIN - turns_since)
+        return max(0, c.MIN_T - snapshot.time_elapsed)
 
-    def _sync_ark_information(self, snapshot: HelperSurroundingsSnapshot) -> None:
-        cls = type(self)
+    def _get_best_animal_on_cell(self, cellview: CellView) -> Any | None:
+        """(Helper logic) Finds the best animal to Obtain on the current cell."""
+        if not cellview.animals:
+            return None
 
-        if snapshot.ark_view is not None:
-            ark_animals = {
-                (str(a.species_id), a.gender) for a in snapshot.ark_view.animals
-            }
-            cls.shared_ark_animals = set(ark_animals)
-            cls.shared_ark_version += 1
-            self.ark_animals = set(ark_animals)
-            self.local_ark_version = cls.shared_ark_version
-            self._recompute_personal_priority()
-            return
+        # build set of (species,gender) already in flock to avoid duplicates
+        flock_pairs: set[tuple[str, Gender]] = set()
+        for a in self.flock:
+            try:
+                flock_pairs.add((str(a.species_id), a.gender))
+            except Exception:
+                pass
 
-        if self.local_ark_version != cls.shared_ark_version:
-            self.ark_animals = set(cls.shared_ark_animals)
-            self.local_ark_version = cls.shared_ark_version
-            self._recompute_personal_priority()
+        # Priority 1: Get the animal Noah wants (if it doesn't duplicate our flock)
+        if self.noah_target_species:
+            for animal in cellview.animals:
+                species_name = str(animal).split(" ")[0]
+                # skip species already completed in ark
+                if (
+                    species_name in self.ark_inventory
+                    and len(self.ark_inventory.get(species_name, set())) >= 2
+                ):
+                    continue
+                if species_name == self.noah_target_species:
+                    pair = (species_name, animal.gender)
+                    if pair not in flock_pairs:
+                        return animal
 
-    # ---------- MAIN HOOKS ----------
+        # Priority 2: Prefer needed species (one gender missing on ark)
+        for animal in cellview.animals:
+            if animal.gender == Gender.Unknown:
+                continue
+            s = str(animal.species_id)
+            pair = (s, animal.gender)
+            if pair in flock_pairs:
+                continue
+            # skip species already completed in ark
+            if s in self.ark_inventory and len(self.ark_inventory.get(s, set())) >= 2:
+                continue
+            # prefer species not yet paired on ark
+            if s not in self.ark_inventory or len(self.ark_inventory.get(s, set())) < 2:
+                return animal
+
+        # Priority 3: any animal we don't already carry
+        for animal in cellview.animals:
+            if animal.gender == Gender.Unknown:
+                continue
+            pair = (str(animal.species_id), animal.gender)
+            if pair in flock_pairs:
+                continue
+            return animal
+
+        return None
+
+    def _find_best_animal_to_chase(self) -> tuple[int, int] | None:
+        """(Helper logic) Finds the best animal to chase in sight."""
+        target_cells: list[tuple[float, tuple[int, int]]] = []
+        any_cells: list[tuple[float, tuple[int, int]]] = []
+        CLUSTER_RADIUS = getattr(self, "cluster_radius", 8.0)
+        ARK_PROXIMITY_BONUS = 6.0  # prefer cells nearer the ark
+
+        for cellview in self.sight:
+            if not cellview.animals:
+                continue
+
+            # skip cells claimed by other helpers
+            claim = Player9.shared_claims.get((cellview.x, cellview.y))
+            if claim and claim[0] != self.id:
+                continue
+
+            dist = distance(*self.position, cellview.x, cellview.y)
+            animals_count = len(cellview.animals)
+
+            # Compute local cluster size (animals in neighboring cells within cluster radius)
+            local_count = animals_count
+            for other in self.sight:
+                if other is cellview:
+                    continue
+                if not getattr(other, "animals", None):
+                    continue
+                if distance(cellview.x, cellview.y, other.x, other.y) <= CLUSTER_RADIUS:
+                    local_count += len(other.animals)
+
+            # Prefer nearby clusters (multiple animals across adjacent cells) strongly
+            if local_count >= 2 and dist <= CLUSTER_RADIUS:
+                # treat as high-priority by reducing effective distance (moderate)
+                target_cells.append((dist * 0.5, (cellview.x, cellview.y)))
+                continue
+            # Prioritize cells that complete pairs or match Noah's target
+            pair_bonus = 0.0
+            for animal in cellview.animals:
+                try:
+                    s = str(animal.species_id)
+                except Exception:
+                    s = str(animal)
+                # skip species already completed in ark
+                if (
+                    s in self.ark_inventory
+                    and len(self.ark_inventory.get(s, set())) >= 2
+                ):
+                    continue
+                has_m = s in self.ark_inventory and "M" in self.ark_inventory.get(
+                    s, set()
+                )
+                has_f = s in self.ark_inventory and "F" in self.ark_inventory.get(
+                    s, set()
+                )
+                if not (has_m and has_f):
+                    pair_bonus = max(pair_bonus, 8.0)
+                if self.noah_target_species and s == self.noah_target_species:
+                    pair_bonus += 4.0
+
+            if pair_bonus > 0.0:
+                # apply pair / Noah bonus
+                target_cells.append((dist - pair_bonus, (cellview.x, cellview.y)))
+                continue
+
+            # apply ark proximity bonus for general cells as a fallback
+            ark_dist = distance(
+                self.ark_position[0],
+                self.ark_position[1],
+                cellview.x + 0.5,
+                cellview.y + 0.5,
+            )
+            adj = max(0.0, (100.0 - ark_dist) / 20.0) * ARK_PROXIMITY_BONUS
+            any_cells.append((dist - adj, (cellview.x, cellview.y)))
+
+        # Priority 1: Go for the closest cell that has our target or cluster
+        if target_cells:
+            target_cells.sort(key=lambda x: x[0])
+            return target_cells[0][1]
+
+        # Priority 2: No target in sight. Go for the closest *any* animal.
+        if any_cells:
+            any_cells.sort(key=lambda x: x[0])
+            return any_cells[0][1]
+
+        return None
+
+    def _find_animal_to_drop(self) -> Any | None:
+        """Find an animal in flock that should be dropped: duplicates or completed pairs."""
+        if not self.flock:
+            return None
+
+        # Build flock inventory
+        flock_inv = {}
+        for a in self.flock:
+            try:
+                s = str(a.species_id)
+                g = (
+                    "M"
+                    if a.gender == Gender.Male
+                    else ("F" if a.gender == Gender.Female else None)
+                )
+                if g:
+                    flock_inv.setdefault(s, set()).add(g)
+            except Exception:
+                pass
+
+        # Find animals that are duplicates or complete pairs already in ark
+        for a in self.flock:
+            try:
+                s = str(a.species_id)
+                g = (
+                    "M"
+                    if a.gender == Gender.Male
+                    else ("F" if a.gender == Gender.Female else None)
+                )
+                if not g:
+                    continue
+                # If this species is already fully paired in ark, drop any of it
+                if s in self.ark_inventory and len(self.ark_inventory[s]) >= 2:
+                    return a
+                # If we carry both genders of this species, drop one (prefer to keep the one that completes ark pair)
+                if s in flock_inv and len(flock_inv[s]) >= 2:
+                    # If ark has one gender, keep the missing one, drop the other
+                    ark_genders = self.ark_inventory.get(s, set())
+                    if len(ark_genders) == 1:
+                        missing = "M" if "F" in ark_genders else "F"
+                        if g != missing:
+                            return a
+                    else:
+                        # Ark has none or both, drop any duplicate
+                        return a
+            except Exception:
+                pass
+        return None
+
+    def _find_complement_in_sight(self) -> tuple[int, int] | None:
+        """If we carry animals, look for complementary genders in sight.
+        Return (cell_x, cell_y) to move to, or None."""
+        if not getattr(self, "flock", None):
+            return None
+        # build set of species we carry with genders
+        carry = {}
+        for a in self.flock:
+            try:
+                s = str(a.species_id)
+                carry.setdefault(s, set()).add(a.gender)
+            except Exception:
+                pass
+
+        # prefer to find complements for carried species first
+        for cv in self.sight:
+            if not getattr(cv, "animals", None):
+                continue
+            for a in cv.animals:
+                try:
+                    s = str(a.species_id)
+                except Exception:
+                    continue
+                genders_here = carry.get(s)
+                if not genders_here:
+                    continue
+                # if we carry only one gender, look for the other
+                if Gender.Male in genders_here and a.gender == Gender.Female:
+                    return (cv.x, cv.y)
+                if Gender.Female in genders_here and a.gender == Gender.Male:
+                    return (cv.x, cv.y)
+
+        # as fallback, look for species missing a gender on the ark (completion)
+        for cv in self.sight:
+            if not getattr(cv, "animals", None):
+                continue
+            for a in cv.animals:
+                try:
+                    s = str(a.species_id)
+                except Exception:
+                    continue
+                has_m = s in self.ark_inventory and "M" in self.ark_inventory.get(
+                    s, set()
+                )
+                has_f = s in self.ark_inventory and "F" in self.ark_inventory.get(
+                    s, set()
+                )
+                if not (has_m and has_f):
+                    return (cv.x, cv.y)
+        return None
+
+    def _animal_value(self, animal: Any) -> float:
+        """Heuristic value: rarer species -> higher; completing ark pair gives bonus."""
+        try:
+            s = str(animal.species_id)
+        except Exception:
+            s = str(animal)
+        # rarer species earlier in rarity_order
+        rank = (
+            self.rarity_order.index(s)
+            if s in self.rarity_order
+            else len(self.rarity_order)
+        )
+        base = max(0.1, (len(self.rarity_order) - rank))
+        # completion bonus if ark missing one gender
+        has_m = s in self.ark_inventory and "M" in self.ark_inventory.get(s, set())
+        has_f = s in self.ark_inventory and "F" in self.ark_inventory.get(s, set())
+        completion_bonus = 2.0 if not (has_m and has_f) else 0.0
+        return base + completion_bonus
+
+    # ---------- Sweep & Bounce Logic (No Jitter) ----------
+
+    def _get_sweep_move(self) -> tuple[float, float]:
+        # Move one unit in the sweep_angle direction (straight-line sweep)
+        px, py = self.position
+        dx = math.cos(self.sweep_angle)
+        dy = math.sin(self.sweep_angle)
+
+        target_x = px + dx
+        target_y = py + dy
+
+        # If the next step would go out of bounds, reflect the component and update angle
+        reflected = False
+        if not (0 <= target_x < c.X):
+            dx = -dx
+            reflected = True
+        if not (0 <= target_y < c.Y):
+            dy = -dy
+            reflected = True
+
+        if reflected:
+            self.sweep_angle = math.atan2(dy, dx)
+            target_x = px + dx
+            target_y = py + dy
+
+        # Zig-zag: if far from ark, add a lateral offset alternating each call
+        dist_ark = distance(px, py, self.ark_position[0], self.ark_position[1])
+        if dist_ark >= getattr(self, "zigzag_threshold", 80.0):
+            # perpendicular vector
+            pdx, pdy = -dy, dx
+            # normalize
+            plen = math.hypot(pdx, pdy)
+            if plen > 0:
+                pdx /= plen
+                pdy /= plen
+                phase = 1.0 if self.zigzag_phase else -1.0
+                amp = getattr(self, "zigzag_amplitude", 0.8)
+                target_x += pdx * amp * phase
+                target_y += pdy * amp * phase
+                # flip phase for next call
+                self.zigzag_phase = not self.zigzag_phase
+
+        if self.can_move_to(target_x, target_y):
+            return target_x, target_y
+
+        # fallback to random move if blocked
+        return self._get_random_move()
+
+    def _find_animals_in_corridor(
+        self, lookahead: float = 2.0, corridor: float = 1.5
+    ) -> tuple[int, int] | None:
+        """Find a nearby cell within a forward corridor along sweep direction.
+        Returns cell coords (x,y) or None."""
+        px, py = self.position
+        dx = math.cos(self.sweep_angle)
+        dy = math.sin(self.sweep_angle)
+
+        best = None
+        best_score = float("inf")
+
+        for cv in getattr(self, "sight", []):
+            if not getattr(cv, "animals", None):
+                continue
+            # skip claimed cells
+            claim = Player9.shared_claims.get((cv.x, cv.y))
+            if claim and claim[0] != self.id:
+                continue
+            cx = cv.x + 0.5
+            cy = cv.y + 0.5
+            vx = cx - px
+            vy = cy - py
+            forward = vx * dx + vy * dy
+            if forward < 0 or forward > lookahead:
+                continue
+            perp_sq = (vx * vx + vy * vy) - forward * forward
+            perp = math.sqrt(max(0.0, perp_sq))
+            if perp > corridor:
+                continue
+            # score: prefer small perp, then small forward
+            score = perp * 10.0 + forward
+            if score < best_score:
+                best_score = score
+                best = (cv.x, cv.y)
+
+        return best
+
+    def _find_nearby_animal_cell(self, radius: float = 1.6) -> tuple[int, int] | None:
+        """Finds a nearby cell (within radius) that contains animals and is unclaimed."""
+        px, py = self.position
+        best = None
+        best_d = float("inf")
+        for cv in getattr(self, "sight", []):
+            if not getattr(cv, "animals", None):
+                continue
+            # skip current cell
+            if int(cv.x) == int(px) and int(cv.y) == int(py):
+                continue
+            claim = Player9.shared_claims.get((cv.x, cv.y))
+            if claim and claim[0] != self.id:
+                continue
+            d = distance(px, py, cv.x, cv.y)
+            if d <= radius and d < best_d:
+                best_d = d
+                best = (cv.x, cv.y)
+        return best
+
+    # ---------- MAIN HOOKS (Updated) ----------
 
     def check_surroundings(self, snapshot: HelperSurroundingsSnapshot) -> int:
         """
-        Observe surroundings and broadcast a message.
-
-        - Noah: broadcast rarest-needed species (encoded as int).
-        - Helpers: broadcast their current sector index + 1 (0 reserved).
+        Called by the simulator for *both* Noah and Helpers.
+        Noah broadcasts. Helpers sync.
         """
-        self.position = snapshot.position
-        self.flock = set(snapshot.flock)
-        self.current_snapshot = snapshot
-
-        self.current_sector = self._sector_for_position(
-            snapshot.position[0], snapshot.position[1]
-        )
-
-        self._sync_ark_information(snapshot)
-
-        # Noah: species recommendation
         if self.kind == Kind.Noah:
+            # --- NOAH'S LOGIC ---
             target_species = self._find_rarest_needed_species()
             if target_species:
                 msg = self.species_to_int.get(target_species, 0)
                 return msg
-            return 0
+            else:
+                return 0  # 0 = "Get anything"
 
-        # Helpers: rain / time
-        self.is_raining = snapshot.is_raining
-        if self.is_raining and self.rain_start_turn is None:
-            self.rain_start_turn = snapshot.time_elapsed
+        else:
+            # --- HELPER'S LOGIC ---
+            self.position = snapshot.position
+            self.flock = snapshot.flock
+            self.sight = snapshot.sight
+            self.is_raining = snapshot.is_raining
+            # store last snapshot for roundtrip safety checks in get_action
+            self._last_snapshot = snapshot
 
-        distance_to_ark = hypot(
-            self.position[0] - self.ark_position[0],
-            self.position[1] - self.ark_position[1],
-        )
-        turns_to_return = ceil(distance_to_ark / c.MAX_DISTANCE_KM)
-        available_turns = self._get_available_turns(snapshot)
+            # reset local_collects when at ark
+            if int(self.position[0]) == int(self.ark_position[0]) and int(
+                self.position[1]
+            ) == int(self.ark_position[1]):
+                self.local_collects = 0
 
-        self.forced_return = turns_to_return + 10 > available_turns
+            # Tick down shared claims TTL (class-level shared_claims)
+            expired: list[tuple[int, int]] = []
+            for k, v in list(Player9.shared_claims.items()):
+                owner, ttl = v
+                ttl -= 1
+                if ttl <= 0:
+                    expired.append(k)
+                else:
+                    Player9.shared_claims[k] = (owner, ttl)
+            for k in expired:
+                del Player9.shared_claims[k]
+            # Update ark inventory from snapshot if present
+            if (
+                getattr(snapshot, "ark_view", None) is not None
+                and snapshot.ark_view is not None
+            ):
+                self.ark_inventory = {}
+                for a in snapshot.ark_view.animals:
+                    try:
+                        s = str(a.species_id)
+                        g = (
+                            "M"
+                            if a.gender == Gender.Male
+                            else ("F" if a.gender == Gender.Female else None)
+                        )
+                        if g is None:
+                            continue
+                        self.ark_inventory.setdefault(s, set()).add(g)
+                    except Exception:
+                        pass
 
-        # --- FIX: Make ForcedReturn consistent with AtArk ---
-        if self._is_at_ark(snapshot):
-            self.forced_return = False
-        # --- END FIX ---
+            # Simple "hello" protocol
+            if len(self.hellos_received) == 0:
+                msg = 1 << (self.id % 8)
+            else:
+                msg = 0
+                for hello in self.hellos_received:
+                    msg |= hello
+                self.hellos_received = []
 
-        # Helpers broadcast their sector + 1 (0 reserved)
-        return (self.current_sector + 1) if self.current_sector is not None else 0
+            if not self.is_message_valid(msg):
+                msg = msg & 0xFF
+
+            return msg
 
     def get_action(self, messages: list[Message]) -> Action | None:
+        """
+        Called by the simulator for *both* Noah and Helpers.
+        Noah does nothing. Helpers act.
+        """
+
         if self.kind == Kind.Noah:
-            return None
+            return None  # Noah doesn't move or act
 
-        snapshot = self.current_snapshot
-        if not snapshot:
-            return None
+        # --- HELPER'S LOGIC ---
 
-        # Ensure stuck-tracking fields exist (in case __init__ wasn't patched)
-        if not hasattr(self, "last_cell"):
-            self.last_cell: tuple[int, int] | None = None
-            self.last_flock_size: int = 0
-            self.stuck_turns: int = 0
-
-        # --- Logging setup ---
-        my_id = f"H{self.id} [T{snapshot.time_elapsed}]"
-        flock_size = len(self.flock)
-        pos = f"({self.position[0]:.1f}, {self.position[1]:.1f})"
-        print(f"--- {my_id}: STATE ---")
-        print(
-            f"{my_id}: Pos={pos} | Flock={flock_size}/{self.FLOCK_CAPACITY} | ForcedReturn={self.forced_return}"
-        )
-
-        # --- Message decoding ---
-        occupied_sectors: set[int] = set()
+        # 1. Listen for Noah's broadcast
         for msg in messages:
             if msg.from_helper.kind == Kind.Noah:
                 self.noah_target_species = self.int_to_species.get(msg.contents)
-            else:
-                sector_code = msg.contents
-                if sector_code > 0:
-                    sector_id = sector_code - 1
-                    occupied_sectors.add(sector_id)
+                break
 
-        if self.current_sector is not None and self.current_sector in occupied_sectors:
-            occupied_sectors.discard(self.current_sector)
+        # 2. Handle "Hello" messages
+        for msg in messages:
+            if msg.from_helper.kind == Kind.Helper:
+                if 1 << (msg.from_helper.id % 8) == msg.contents:
+                    self.hellos_received.append(msg.contents)
 
-        print(
-            f"{my_id}: NoahTarget={self.noah_target_species} | OccupiedSectors={occupied_sectors}"
-        )
+        # 3. Decide on an Action
 
-        cellview = self._get_my_cell(snapshot)
-        at_ark = self._is_at_ark(snapshot)
-        print(f"{my_id}: AtArk={at_ark}")
+        # Priority 1: Safety / Flood Awareness / Full Inventory
+        if self.is_raining:
+            # Raining = flood is spreading → get to Ark ASAP
+            return Move(*self.move_towards(*self.ark_position))
 
-        # --- Stuck detection (only when NOT at ark) ---
-        xcell, ycell = int(self.position[0]), int(self.position[1])
+        # If the game exposes time until flood or similar:
+        if hasattr(self, "time_remaining"):
+            # If far away from the ark, start returning before the flood kills the helper
+            dist_to_ark = distance(*self.position, *self.ark_position)
+            if dist_to_ark > 40:
+                return Move(*self.move_towards(*self.ark_position))
+
+        # Priority 2: If raining or flock full, return to Ark; otherwise allow local collection
+        flock_size = len(self.flock)
+        if self.is_raining or flock_size >= self.FLOCK_CAPACITY:
+            return Move(*self.move_towards(*self.ark_position))
+
+        # If carrying animals, allow multiple local extra collects before returning.
+        if flock_size > 0:
+            # try nearby adjacent collects first (up to max allowed)
+            if getattr(self, "local_collects", 0) < getattr(
+                self, "max_local_collects", 2
+            ):
+                nearby = self._find_nearby_animal_cell(radius=1.6)
+                if nearby:
+                    nx, ny = nearby
+                    Player9.shared_claims[(nx, ny)] = (self.id, Player9.CLAIM_TTL)
+                    return Move(*self.move_towards(nx + 0.5, ny + 0.5))
+            # otherwise return to ark
+            return Move(*self.move_towards(*self.ark_position))
+
+        # unstuck detection: if we've been on same cell with same flock repeatedly, try random move
+        cx, cy = int(self.position[0]), int(self.position[1])
+        cellview_current = None
+        try:
+            if self.sight.cell_is_in_sight(cx, cy):
+                cellview_current = self.sight.get_cellview_at(cx, cy)
+        except Exception:
+            cellview_current = None
+
         if (
-            not at_ark
-            and self.last_cell == (xcell, ycell)
+            self.last_cell == (cx, cy)
             and self.last_flock_size == flock_size
-            and cellview
-            and cellview.animals
+            and cellview_current
+            and getattr(cellview_current, "animals", None)
         ):
             self.stuck_turns += 1
         else:
-            if not at_ark:
-                self.stuck_turns = 0  # reset when moving or changing flock off-ark
-
-        self.last_cell = (xcell, ycell)
+            self.stuck_turns = 0
+        self.last_cell = (cx, cy)
         self.last_flock_size = flock_size
 
-        print(f"{my_id}: StuckTurns={self.stuck_turns}")
+        if self.stuck_turns >= 3:
+            rx, ry = self._get_random_move()
+            return Move(rx, ry)
 
-        CONSIDER_STUCK_AFTER = 3
-        cell_is_stuck = (self.stuck_turns >= CONSIDER_STUCK_AFTER) and (not at_ark)
+        # Drop unnecessary animals if flock is full
+        if len(self.flock) >= self.FLOCK_CAPACITY:
+            bad_animal = self._find_animal_to_drop()
+            if bad_animal:
+                return Release(bad_animal)
 
-        # ============================================================
-        # 1. AT ARK LOGIC
-        # ============================================================
+        # If we are on the Ark, try to collect animals from the ark cell first, then nearby cells
+        at_ark = int(self.position[0]) == int(self.ark_position[0]) and int(
+            self.position[1]
+        ) == int(self.ark_position[1])
         if at_ark:
-            print(f"{my_id}: LOGIC: AT_ARK block.")
-            self.forced_return = False
+            # First, try to obtain a needed animal from the ark cell itself
+            cx, cy = int(self.ark_position[0]), int(self.ark_position[1])
+            if self.sight.cell_is_in_sight(cx, cy):
+                ark_cellview = self.sight.get_cellview_at(cx, cy)
+                if ark_cellview.animals:
+                    animal_to_get = self._get_best_animal_on_cell(ark_cellview)
+                    if animal_to_get:
+                        return Obtain(animal_to_get)
 
-            # Being on the ark is not "stuck" for hunting purposes
-            self.stuck_turns = 0
+            # If no animals in ark cell or none needed, look for nearby visible cells (distance <= 2.5) with animals (exclude ark cell)
+            best = None
+            best_d = float("inf")
+            for cv in self.sight:
+                if not getattr(cv, "animals", None):
+                    continue
+                if int(cv.x) == int(self.ark_position[0]) and int(cv.y) == int(
+                    self.ark_position[1]
+                ):
+                    continue
+                dx = (cv.x + 0.5) - self.ark_position[0]
+                dy = (cv.y + 0.5) - self.ark_position[1]
+                ad = math.hypot(dx, dy)
+                if ad <= 2.5 and ad < best_d:
+                    best = (cv.x, cv.y)
+                    best_d = ad
+            if best is not None:
+                # move to nearest adjacent animal cell immediately
+                tx, ty = best
+                return Move(*self.move_towards(tx + 0.5, ty + 0.5))
 
-            # IMPORTANT: animals visible on the ark cell are ark animals.
-            # We must NOT try to Obtain them or we will spam Obtain forever.
-            # So: NEVER Obtain on the ark cell.
-
-            # If time is very low, just stay safely on the ark.
-            available_turns = self._get_available_turns(snapshot)
-            if available_turns <= 5:
-                print(f"{my_id}: AT_ARK: Time low. WAITING on ark.")
-                return None
-
-            # Otherwise, look for nearby wild targets to chase.
-            print(f"{my_id}: AT_ARK: Looking for nearby targets (greedy).")
-            best_animal_pos = self._find_best_animal_to_chase(
-                snapshot, avoid_sectors=occupied_sectors
-            )
-            if best_animal_pos:
-                print(f"{my_id}: AT_ARK: Found target at {best_animal_pos}. MOVING.")
-                return self._move_to_cell(*best_animal_pos)
-
-            # If no target in sight, optionally wander away if there is enough time.
-            MIN_TIME_TO_LEAVE_ARK = 12  # (10 for margin + 2 for buffer)
-            print(
-                f"{my_id}: AT_ARK: No targets. Turns left: {available_turns}. Need > {MIN_TIME_TO_LEAVE_ARK} to wander."
-            )
-            if available_turns > MIN_TIME_TO_LEAVE_ARK:
-                sweep_move = self._get_sweep_move()
-                if sweep_move is not None:
-                    print(f"{my_id}: AT_ARK: Sweeping away.")
-                    return sweep_move
-                rand_move = self._get_random_move()
-                if rand_move is not None:
-                    print(f"{my_id}: AT_ARK: Random move away.")
-                    return rand_move
-                print(f"{my_id}: AT_ARK: All moves failed. WAITING.")
+        # Priority 3: Obtain one animal if on a cell with one (pick-and-return behavior)
+        cellview = self._get_my_cell()
+        # If empty, always pick one.
+        if len(self.flock) == 0 and len(cellview.animals) > 0:
+            animal_to_get = self._get_best_animal_on_cell(cellview)
+            if animal_to_get:
+                self.stay_turns = 0
+                return Obtain(animal_to_get)
+        # Conditional multi-pick: if we carry less than capacity, allow additional picks on this cell if
+        # (a) another valid animal is present on this cell, or
+        # (b) roundtrip safety check shows ample margin (>12 turns)
+        if len(self.flock) < self.FLOCK_CAPACITY and len(cellview.animals) > 0:
+            another = self._get_best_animal_on_cell(cellview)
+            if another:
+                cond_a = True
             else:
-                print(f"{my_id}: AT_ARK: Not enough time to move. WAITING.")
-            return None
+                cond_a = False
+            cond_b = False
+            if getattr(self, "_last_snapshot", None) is not None:
+                try:
+                    cond_b = self._roundtrip_safe(
+                        self._last_snapshot, cellview.x, cellview.y, extra_margin=12
+                    )
+                except Exception:
+                    cond_b = False
+            if (
+                (cond_a or cond_b)
+                and another
+                and getattr(self, "local_collects", 0)
+                < getattr(self, "max_local_collects", 2)
+            ):
+                # mark we've done an extra local collect
+                self.local_collects += 1
+                return Obtain(another)
 
-        # ============================================================
-        # 2. NOT AT ARK
-        # ============================================================
-        print(f"{my_id}: LOGIC: NOT_AT_ARK. Checking current cell.")
-        animals_on_cell = bool(cellview and cellview.animals)
-        best_to_obtain = None
+        # Priority 4: Chase the "best" animal in sight
 
-        # 2a) Safety: forced return overrides everything
-        if self.forced_return:
-            print(f"{my_id}: NOT_AT_ARK: FORCED RETURN. Moving to Ark.")
-            return self._move_to_ark()
-
-        # 2b) FLOCK FULL: maybe swap, then bank
-        if self.is_flock_full():
-            print(
-                f"{my_id}: NOT_AT_ARK: Flock is full. Checking for swap, then returning."
-            )
-            release_action = self._get_smart_release(cellview)
-            if release_action:
-                print(f"{my_id}: NOT_AT_ARK: Swapping animal. RELEASING.")
-                return release_action
-            return self._move_to_ark()
-
-        # 2c) CARRYING SOME ANIMALS (1–3): be score-greedy but allow small cluster grabs
+        # If carrying animals, prefer complements/needed targets first
         if flock_size > 0:
-            available_turns = self._get_available_turns(snapshot)
+            comp = self._find_complement_in_sight()
+            if comp:
+                tx, ty = comp
+                # if on same cell, obtain will be handled via cell logic above
+                return Move(*self.move_towards(tx + 0.5, ty + 0.5))
 
-            # Free extra grab on current cell (if not stuck)
-            if animals_on_cell and not cell_is_stuck:
-                best_to_obtain = self._get_best_animal_on_cell(cellview)
-                if best_to_obtain:
-                    print(
-                        f"{my_id}: NOT_AT_ARK: Carrying {flock_size}, free animal on cell. OBTAINING."
-                    )
-                    return Obtain(best_to_obtain)
+            # If there are nearby animal-containing cells (adjacent), go collect them first
+            # but limit to a small number of extra local collects to avoid over-roaming
+            if getattr(self, "local_collects", 0) < getattr(
+                self, "max_local_collects", 1
+            ):
+                nearby = self._find_nearby_animal_cell(radius=1.6)
+                if nearby:
+                    nx, ny = nearby
+                    Player9.shared_claims[(nx, ny)] = (self.id, Player9.CLAIM_TTL)
+                    return Move(*self.move_towards(nx + 0.5, ny + 0.5))
 
-            # Try to chase a *very* nearby target if:
-            # - within a small radius
-            # - plenty of time left
-            CLUSTER_RADIUS = 20.0  # tighter radius for "extra greed"
-            MIN_TURNS_FOR_EXTRA = 15
+        # Role-specific behaviors before general corridor/chase
+        if getattr(self, "role", "sweeper") == "cluster":
+            best = None
+            best_d = float("inf")
+            for cv in self.sight:
+                if not getattr(cv, "animals", None):
+                    continue
+                if len(cv.animals) < 2:
+                    continue
+                claim = Player9.shared_claims.get((cv.x, cv.y))
+                if claim and claim[0] != self.id:
+                    continue
+                d = distance(*self.position, cv.x, cv.y)
+                if d < best_d:
+                    best_d = d
+                    best = (cv.x, cv.y)
+            if best:
+                Player9.shared_claims[(best[0], best[1])] = (self.id, Player9.CLAIM_TTL)
+                return Move(*self.move_towards(best[0] + 0.5, best[1] + 0.5))
 
-            best_animal_pos = self._find_best_animal_to_chase(
-                snapshot, avoid_sectors=occupied_sectors
-            )
-            if best_animal_pos:
-                tx, ty = best_animal_pos
-                dist = distance(self.position[0], self.position[1], tx + 0.5, ty + 0.5)
-                print(
-                    f"{my_id}: NOT_AT_ARK: Carrying {flock_size}, nearby target at {best_animal_pos} (dist={dist:.1f}, avail={available_turns})."
+        if getattr(self, "role", "sweeper") == "ark_runner":
+            best = None
+            best_d = float("inf")
+            for cv in self.sight:
+                if not getattr(cv, "animals", None):
+                    continue
+                # prefer cells close to ark
+                ad = distance(
+                    self.ark_position[0], self.ark_position[1], cv.x + 0.5, cv.y + 0.5
                 )
-
-                if dist <= CLUSTER_RADIUS and available_turns > MIN_TURNS_FOR_EXTRA:
-                    print(
-                        f"{my_id}: NOT_AT_ARK: Extra cluster is close and time is safe. CHASING before banking."
-                    )
-                    return self._move_to_cell(tx, ty)
-
-            # Otherwise, just bank the score.
-            print(
-                f"{my_id}: NOT_AT_ARK: Carrying {flock_size}. No safe close cluster. RETURNING TO ARK."
-            )
-            return self._move_to_ark()
-
-        # 2d) EMPTY FLOCK: try to obtain on our cell, unless it's a "stuck" cell.
-        if animals_on_cell and not cell_is_stuck:
-            best_to_obtain = self._get_best_animal_on_cell(cellview)
-            if best_to_obtain:
-                print(
-                    f"{my_id}: NOT_AT_ARK: EMPTY + found {best_to_obtain.species_id} on my cell. OBTAINING."
+                if ad > getattr(self, "ark_radius", 8.0):
+                    continue
+                claim = Player9.shared_claims.get((cv.x, cv.y))
+                if claim and claim[0] != self.id:
+                    continue
+                d = distance(*self.position, cv.x, cv.y) - (
+                    getattr(self, "ark_bonus", 10.0) * max(0.0, (100.0 - ad) / 20.0)
                 )
-                return Obtain(best_to_obtain)
+                if d < best_d:
+                    best_d = d
+                    best = (cv.x, cv.y)
+            if best:
+                Player9.shared_claims[(best[0], best[1])] = (self.id, Player9.CLAIM_TTL)
+                return Move(*self.move_towards(best[0] + 0.5, best[1] + 0.5))
 
-        # 2e) If animals here but we consider this cell stuck → sweep away
-        if animals_on_cell and cell_is_stuck:
-            print(f"{my_id}: NOT_AT_ARK: Animals here but STUCK. SWEEPING away.")
-            return self._get_sweep_move()
-
-        # ============================================================
-        # 3. HUNTING LOGIC (ONLY WHEN EMPTY & not stuck)
-        # ============================================================
-        print(f"{my_id}: LOGIC: HUNT while empty. Looking for targets.")
-        best_animal_pos = self._find_best_animal_to_chase(
-            snapshot, avoid_sectors=occupied_sectors
+        # corridor grabbing: use per-helper corridor parameters
+        corridor_target = self._find_animals_in_corridor(
+            lookahead=self.corridor_lookahead, corridor=self.corridor_width
         )
+        if corridor_target and not self.is_raining:
+            tx, ty = corridor_target
+            # claim this cell for a short time so others avoid it
+            Player9.shared_claims[(tx, ty)] = (self.id, Player9.CLAIM_TTL)
+            return Move(*self.move_towards(tx + 0.5, ty + 0.5))
 
+        best_animal_pos = self._find_best_animal_to_chase()
         if best_animal_pos:
-            print(f"{my_id}: HUNT: Chasing target at {best_animal_pos}. MOVING.")
-            return self._move_to_cell(*best_animal_pos)
+            bx, by = best_animal_pos
+            # smart release: if flock is full, and a clearly better animal exists at target,
+            # release the lowest-value carried animal to swap.
+            if len(self.flock) >= self.FLOCK_CAPACITY:
+                # find the candidate animal on that cell
+                candidate = None
+                for cv in self.sight:
+                    if cv.x == bx and cv.y == by and getattr(cv, "animals", None):
+                        candidate = self._get_best_animal_on_cell(cv)
+                        break
+                if candidate:
+                    cand_val = self._animal_value(candidate)
+                    # find lowest-value carried animal
+                    min_val = float("inf")
+                    min_animal = None
+                    for a in self.flock:
+                        v = self._animal_value(a)
+                        if v < min_val:
+                            min_val = v
+                            min_animal = a
+                    if min_animal and cand_val > min_val + 0.5:
+                        return Release(min_animal)
 
-        # No target in sight: sweep to find something.
-        print(f"{my_id}: HUNT: No targets in sight. SWEEPING.")
-        return self._get_sweep_move()
+            # claim the target and move towards it
+            Player9.shared_claims[(bx, by)] = (self.id, Player9.CLAIM_TTL)
+            return Move(*self.move_towards(bx + 0.5, by + 0.5))
+
+        # Priority 5: No animals in sight, sweep the grid
+        new_x, new_y = self._get_sweep_move()
+        return Move(new_x, new_y)

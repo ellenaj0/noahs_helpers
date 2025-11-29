@@ -57,6 +57,9 @@ class IndependentPlayer(Player):
         )
         self.turns_since_last_hunt = 999  # Turns since last hunt
 
+        # Track consecutive edge hits (to detect stuck in corner scenarios)
+        self.consecutive_edge_hits = 0  # Number of consecutive times hit edge
+
         # Sector assignment: divide 360 degrees among helpers (excluding Noah)
         # with soft weighting based on ark position
         # Noah is id=0, real helpers are id=1, 2, ..., num_helpers-1
@@ -101,9 +104,9 @@ class IndependentPlayer(Player):
                 max_distance = min(t_x, t_y, 1000)  # Cap at reasonable distance
 
                 # Inverse weighting: larger explorable area → smaller sector angle
-                # Logic: large areas need smaller angles to cover similar actual area
-                # Use 1 / (distance^0.8) for soft inverse weighting
-                weight = 1.0 / (max_distance**0.85)
+                # Logic: short distances need larger angles to compensate for small coverage area
+                # Use 1 / (distance^0.5) for moderate inverse weighting
+                weight = 1.0 / (max_distance**0.5)
                 helper_weights.append(weight)
 
             # Normalize weights to sum to 360 degrees
@@ -134,7 +137,8 @@ class IndependentPlayer(Player):
         self.local_ark_version = type(self).shared_ark_version
 
         # Safety margin: return this many turns before the end
-        self.safety_margin = 100
+        # Increased to 200 for more reliable returns with 20 helpers
+        self.safety_margin = 200
 
         # For Noah, just stay still
         if kind == Kind.Noah:
@@ -200,6 +204,24 @@ class IndependentPlayer(Player):
             abs(current_x - self.ark_position[0]) <= c.EPS
             and abs(current_y - self.ark_position[1]) <= c.EPS
         )
+
+        # Priority 0 (HIGHEST): If forced to return due to time, override all other behaviors
+        # This ensures all helpers return to ark before deadline
+        if self.forced_return and not at_ark:
+            # Cancel any hunting state
+            if self.state in ("hunting", "returning_to_discovery"):
+                self.state = "returning"
+                self.target_animal_cell = None
+                self.target_species_id = None
+                self.discovery_position = None
+                self.previous_state = None
+
+            # Force returning state
+            if self.state != "returning":
+                self.state = "returning"
+
+            # Immediately return to ark, no other actions
+            return self._return_to_ark(snapshot)
 
         # Priority 1: Release animals that ark already has (to free space)
         if len(self.flock) > 0:
@@ -508,6 +530,8 @@ class IndependentPlayer(Player):
             abs(target_x - target_x_clamped) > 0.1
             or abs(target_y - target_y_clamped) > 0.1
         ):
+            # Hit edge! Increment counter
+            self.consecutive_edge_hits += 1
             self.state = "returning"
             return self._return_to_ark(snapshot)
 
@@ -540,6 +564,8 @@ class IndependentPlayer(Player):
         distance_check = distance_to_target_sq * 0.5 <= c.MAX_DISTANCE_KM
 
         if distance_check and 0 <= target_x < c.X and 0 <= target_y < c.Y:
+            # Successfully moving - reset edge hit counter
+            self.consecutive_edge_hits = 0
             return Move(target_x, target_y)
 
         # If we can't move further (edge case), return to ark
@@ -570,8 +596,9 @@ class IndependentPlayer(Player):
         # Add clockwise offset to explore different areas on return
         # Only apply offset in the initial phase of return (far from ark)
         # Then switch to direct path to ensure efficient return
-        if dist > 100:
-            # Far from ark (>100km): apply clockwise offset to explore new areas
+        # NEVER use offset when forced to return (time constraint) - go directly to ark
+        if dist > 100 and not self.forced_return:
+            # Far from ark (>100km) and not forced: apply clockwise offset to explore new areas
             # Offset formula: min(30°, distance / 15) gives ~1° per 15km, max 30°
             offset_radians = radians(min(30, dist / 15))
 
@@ -618,6 +645,21 @@ class IndependentPlayer(Player):
         if distance_check and 0 <= target_x < c.X and 0 <= target_y < c.Y:
             return Move(target_x, target_y)
 
+        # If normal check failed but we're forced to return, try moving directly anyway
+        # Use a smaller step to ensure we can reach ark before deadline
+        if self.forced_return and dist > 0:
+            # Emergency mode: move directly toward ark with maximum possible distance
+            small_step = min(dist, c.MAX_DISTANCE_KM * 0.95)
+            scale = small_step / dist
+            emergency_x = current_x + dx * scale
+            emergency_y = current_y + dy * scale
+
+            # Clamp to valid bounds
+            emergency_x = max(0, min(c.X - 1, emergency_x))
+            emergency_y = max(0, min(c.Y - 1, emergency_y))
+
+            return Move(emergency_x, emergency_y)
+
         return None
 
     def _move_towards_position(
@@ -663,8 +705,22 @@ class IndependentPlayer(Player):
         Strategy: select the angle that maximizes the minimum distance to all "obstacles"
         (explored outbound angles, explored return angles, AND sector boundaries).
 
+        Special case: If hit edge 2+ times consecutively, choose random direction to escape corners.
+
         Example: sector 0-90, explored outbound [0], return [10] -> choose ~50 (far from all)
         """
+        # If hit edge twice in a row, use random direction to escape corner
+        if self.consecutive_edge_hits >= 2:
+            import random
+
+            # Random angle from entire 0-360 degree range (not just sector)
+            # This helps escape corners and edges effectively
+            self.current_target_angle = random.random() * 360.0
+            self.explored_angles.append(self.current_target_angle)
+            # Reset counter after choosing random direction
+            self.consecutive_edge_hits = 0
+            return
+
         num_samples = 72  # Sample more candidates for better coverage
         candidates = []
 
@@ -713,6 +769,10 @@ class IndependentPlayer(Player):
 
         self.current_target_angle = best_angle
         self.explored_angles.append(best_angle)
+
+        # Successfully chose new direction - reset edge hit counter
+        # (will be incremented again if we hit edge on next exploration)
+        self.consecutive_edge_hits = 0
 
     def _find_nearest_needed_animal(
         self, snapshot: HelperSurroundingsSnapshot
