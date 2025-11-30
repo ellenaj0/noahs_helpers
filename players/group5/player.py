@@ -149,13 +149,31 @@ class Player5(Player):
             return
 
         species_list = sorted(
-            [(name, count) for name, count in self.species_stats.items() if count >= 6],
+            [(name, count) for name, count in self.species_stats.items()],
             key=itemgetter(1),
         )
 
         total_population = sum(count for _, count in species_list)
 
+        #NEW CODE
+        if species_list:
+            smallest_count = species_list[0][1]   # First item (e.g., 20)
+            biggest_count = species_list[-1][1]   # Last item (e.g., 200)
+
+            # If smallest is <= half of the biggest, we stop specialization
+            if smallest_count >= (biggest_count * 0.5):
+                self.is_specialized = False
+                self.specialization_limit = 0
+                self.specialization_target_species = []
+                return
+
         if total_population == 0:
+            self.is_specialized = False
+            self.specialization_limit = 0
+            self.specialization_target_species = []
+            return
+
+        if len(species_list) > self.num_helpers * 50:
             self.is_specialized = False
             self.specialization_limit = 0
             self.specialization_target_species = []
