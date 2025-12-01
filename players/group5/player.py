@@ -285,7 +285,7 @@ class Player5(Player):
 
             if (species_id, Gender.Female) not in self.obtained_species and (
                 species_id,
-                Gender.Male,
+                Gender.Female,
             ) not in final_search_list:
                 final_search_list.append((species_id, Gender.Female))
 
