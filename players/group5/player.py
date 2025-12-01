@@ -106,7 +106,14 @@ class Player5(Player):
             self.region_center_x = (self.region_min_x + self.region_max_x) / 2
             self.region_center_y = (self.region_min_y + self.region_max_y) / 2
 
-            self.has_reached_region = False
+            region_center_dist = math.sqrt((self.region_center_x - ark_x)**2 + (self.region_center_y - ark_y)**2)
+
+            # If region unreachable (>1000 units), skip region navigation
+            if region_center_dist > 1000.0:
+                print(f"  WARNING: Region unreachable, skipping to exploration")
+                self.has_reached_region = True
+            else:
+                self.has_reached_region = False
             self.saved_exploration_pos: Optional[Tuple[float, float]] = None
         else:
             self.region_min_x = MIN_MAP_COORD
