@@ -807,7 +807,8 @@ class Player5(Player):
         current_pos = (current_x, current_y)
 
         # GREEDY MODE: If < 5 helpers and < 500 turns
-        greedy_mode = self.num_helpers < 5 and self.time_elapsed < 500
+        # greedy_mode = self.num_helpers < 5 and self.time_elapsed < 500
+        greedy_mode = False
 
         # Check if we've reached our assigned region (do this every turn)
         if not self.has_reached_region and self.assigned_region_id is not None:
