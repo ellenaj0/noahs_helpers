@@ -71,7 +71,9 @@ class Player5(Player):
         self.region_cols = int(math.ceil(num_active_helpers / self.region_rows))
 
         if self.id > 0:
-            self.assigned_region_id = (self.id - 1) % (self.region_rows * self.region_cols)
+            self.assigned_region_id = (self.id - 1) % (
+                self.region_rows * self.region_cols
+            )
         else:
             self.assigned_region_id = None
         if self.assigned_region_id is not None:
@@ -88,25 +90,44 @@ class Player5(Player):
                 region_start_col = region_col * (base_width_in_cells + 1)
                 region_width_in_cells = base_width_in_cells + 1
             else:
-                region_start_col = extra_width_cells * (base_width_in_cells + 1) + (region_col - extra_width_cells) * base_width_in_cells
+                region_start_col = (
+                    extra_width_cells * (base_width_in_cells + 1)
+                    + (region_col - extra_width_cells) * base_width_in_cells
+                )
                 region_width_in_cells = base_width_in_cells
 
             if region_row < extra_height_cells:
                 region_start_row = region_row * (base_height_in_cells + 1)
                 region_height_in_cells = base_height_in_cells + 1
             else:
-                region_start_row = extra_height_cells * (base_height_in_cells + 1) + (region_row - extra_height_cells) * base_height_in_cells
+                region_start_row = (
+                    extra_height_cells * (base_height_in_cells + 1)
+                    + (region_row - extra_height_cells) * base_height_in_cells
+                )
                 region_height_in_cells = base_height_in_cells
 
-            self.region_min_x = float(MIN_MAP_COORD + region_start_col * self.grid_cell_size)
-            self.region_max_x = float(MIN_MAP_COORD + (region_start_col + region_width_in_cells) * self.grid_cell_size)
-            self.region_min_y = float(MIN_MAP_COORD + region_start_row * self.grid_cell_size)
-            self.region_max_y = float(MIN_MAP_COORD + (region_start_row + region_height_in_cells) * self.grid_cell_size)
+            self.region_min_x = float(
+                MIN_MAP_COORD + region_start_col * self.grid_cell_size
+            )
+            self.region_max_x = float(
+                MIN_MAP_COORD
+                + (region_start_col + region_width_in_cells) * self.grid_cell_size
+            )
+            self.region_min_y = float(
+                MIN_MAP_COORD + region_start_row * self.grid_cell_size
+            )
+            self.region_max_y = float(
+                MIN_MAP_COORD
+                + (region_start_row + region_height_in_cells) * self.grid_cell_size
+            )
 
             self.region_center_x = (self.region_min_x + self.region_max_x) / 2
             self.region_center_y = (self.region_min_y + self.region_max_y) / 2
 
-            region_center_dist = math.sqrt((self.region_center_x - ark_x)**2 + (self.region_center_y - ark_y)**2)
+            region_center_dist = math.sqrt(
+                (self.region_center_x - ark_x) ** 2
+                + (self.region_center_y - ark_y) ** 2
+            )
 
             # If region unreachable (>1000 units), skip region navigation
             if region_center_dist > 1000.0:
@@ -162,10 +183,10 @@ class Player5(Player):
 
         total_population = sum(count for _, count in species_list)
 
-        #NEW CODE
+        # NEW CODE
         if species_list:
-            smallest_count = species_list[0][1]   # First item (e.g., 20)
-            biggest_count = species_list[-1][1]   # Last item (e.g., 200)
+            smallest_count = species_list[0][1]  # First item (e.g., 20)
+            biggest_count = species_list[-1][1]  # Last item (e.g., 200)
 
             # If smallest is <= half of the biggest, we stop specialization
             if smallest_count >= (biggest_count * 0.5):
@@ -297,8 +318,10 @@ class Player5(Player):
     def _is_in_assigned_region(self, x: float, y: float) -> bool:
         if self.assigned_region_id is None:
             return True
-        return (self.region_min_x <= x < self.region_max_x and
-                self.region_min_y <= y < self.region_max_y)
+        return (
+            self.region_min_x <= x < self.region_max_x
+            and self.region_min_y <= y < self.region_max_y
+        )
 
     def _update_obtained_species_from_ark(self, ark_animals: Set):
         ark_set: Set[SpeciesGender] = set()
@@ -616,9 +639,11 @@ class Player5(Player):
         """
         # Save current position so we can resume exploration after dropoff
         # Only save if we're in our assigned region and haven't saved yet
-        if (self.has_reached_region and
-            self.saved_exploration_pos is None and
-            self._is_in_assigned_region(current_pos[0], current_pos[1])):
+        if (
+            self.has_reached_region
+            and self.saved_exploration_pos is None
+            and self._is_in_assigned_region(current_pos[0], current_pos[1])
+        ):
             self.saved_exploration_pos = current_pos
 
         current_dist_to_ark = self._get_distance(current_pos, self.ark_pos)
@@ -875,7 +900,11 @@ class Player5(Player):
             # 1. We're in our assigned region, OR
             # 2. We're actively chasing an animal (animal_target_cell is set), OR
             # 3. We're in greedy mode (< 5 helpers, < 500 turns)
-            can_collect = self.has_reached_region or self.animal_target_cell is not None or greedy_mode
+            can_collect = (
+                self.has_reached_region
+                or self.animal_target_cell is not None
+                or greedy_mode
+            )
 
             if current_cell_view and current_cell_view.animals and can_collect:
                 animal_to_obtain = None
@@ -942,7 +971,9 @@ class Player5(Player):
             return self._get_move_to_target(current_pos, target_cell_center)
 
         # Scan for new animal target (if we've reached our assigned region or in greedy mode)
-        if len(self.flock) < c.MAX_FLOCK_SIZE and (self.has_reached_region or greedy_mode):
+        if len(self.flock) < c.MAX_FLOCK_SIZE and (
+            self.has_reached_region or greedy_mode
+        ):
             # _find_needed_animal_in_sight() uses _is_species_needed with Gender.Unknown
             new_target_cell = self._find_needed_animal_in_sight()
             if new_target_cell:
@@ -1014,7 +1045,9 @@ class Player5(Player):
             if self.is_in_ark() and self.saved_exploration_pos is not None:
                 resume_target = self.saved_exploration_pos
                 self.current_target_pos = resume_target
-                self.saved_exploration_pos = None  # Clear it so we don't keep going back
+                self.saved_exploration_pos = (
+                    None  # Clear it so we don't keep going back
+                )
                 return self._get_move_to_target(current_pos, resume_target)
 
             # If we haven't reached our assigned region yet, head there first
