@@ -11,7 +11,6 @@ import math
 from typing import Set, Tuple, Optional, List, Dict
 from operator import itemgetter
 
-# --- Constants for Player5 Logic ---
 TURN_ADJUSTMENT_RAD = math.radians(0.5)
 MAX_MAP_COORD = 999
 MIN_MAP_COORD = 0
@@ -36,27 +35,21 @@ class Player5(Player):
         num_helpers,
         species_populations: dict[str, int],
     ):
-        # Pass ALL arguments to the base class constructor
         super().__init__(id, ark_x, ark_y, kind, num_helpers, species_populations)
 
-        # Explicitly save properties
         self.species_stats = species_populations
         self.num_helpers = num_helpers
 
-        # --- CRITICAL FIX: Initialize species map defensively ---
         if not hasattr(self, "id_to_species"):
             sorted_names = sorted(self.species_stats.keys())
             self.id_to_species: Dict[int, str] = {
                 i: name for i, name in enumerate(sorted_names)
             }
 
-        # Create the species_to_id reverse lookup dictionary.
         self.species_to_id: Dict[str, int] = {
             name: id_val for id_val, name in self.id_to_species.items()
         }
-        # ---------------------------------------------------------------
 
-        # --- Player 5 State Initialization ---
         self.ark_pos = (float(ark_x), float(ark_y))
 
         self.obtained_species: Set[SpeciesGender] = set()
@@ -64,26 +57,6 @@ class Player5(Player):
         self.previous_position: Tuple[float, float] = self.position
         self.animal_target_cell: Optional[CellView] = None
 
-        h = num_helpers
-        # calc fan-out angle and exclude noah since he stays on boat
-        if self.id > 0:
-            self.base_angle = (2 * math.pi * (self.id - 1)) / (int(h) - 1)
-        else:
-            self.base_angle = 0
-        self.is_exploring_fan_out = True
-
-        self.ignore_list = []  # List of species_ids where internal duplicates were found
-        # Adjust initial exploration distance based on number of helpers
-        # With fewer helpers, we need to explore further out to cover more ground
-        num_searching_helpers = max(1, num_helpers - 1)  # Exclude Noah
-        # Base distance of 100, but increase when there are fewer helpers
-        # With 2 helpers: 100 + 200 = 300; with 10 helpers: 100 + 0 = 100
-        self.max_explore_dis = 100 + max(0, (5 - num_searching_helpers) * 40)
-        self.max_explore_dis = min(400, self.max_explore_dis)  # Cap at 400
-
-        # --- Grid-based Exploration System ---
-        # Divide the map into a grid for systematic exploration
-        # Grid cell size: 50x50 units (20x20 grid cells for 1000x1000 map)
         self.grid_cell_size = 50.0
         self.grid_width = int(
             math.ceil((MAX_MAP_COORD - MIN_MAP_COORD + 1) / self.grid_cell_size)
@@ -92,51 +65,101 @@ class Player5(Player):
             math.ceil((MAX_MAP_COORD - MIN_MAP_COORD + 1) / self.grid_cell_size)
         )
 
-        # Track visited grid cells: (grid_x, grid_y) -> visit_count
+        num_active_helpers = max(1, num_helpers - 1)
+
+        self.region_rows = int(math.sqrt(num_active_helpers))
+        self.region_cols = int(math.ceil(num_active_helpers / self.region_rows))
+
+        if self.id > 0:
+            self.assigned_region_id = (self.id - 1) % (self.region_rows * self.region_cols)
+        else:
+            self.assigned_region_id = None
+        if self.assigned_region_id is not None:
+            region_row = self.assigned_region_id // self.region_cols
+            region_col = self.assigned_region_id % self.region_cols
+
+            base_width_in_cells = self.grid_width // self.region_cols
+            base_height_in_cells = self.grid_height // self.region_rows
+
+            extra_width_cells = self.grid_width % self.region_cols
+            extra_height_cells = self.grid_height % self.region_rows
+
+            if region_col < extra_width_cells:
+                region_start_col = region_col * (base_width_in_cells + 1)
+                region_width_in_cells = base_width_in_cells + 1
+            else:
+                region_start_col = extra_width_cells * (base_width_in_cells + 1) + (region_col - extra_width_cells) * base_width_in_cells
+                region_width_in_cells = base_width_in_cells
+
+            if region_row < extra_height_cells:
+                region_start_row = region_row * (base_height_in_cells + 1)
+                region_height_in_cells = base_height_in_cells + 1
+            else:
+                region_start_row = extra_height_cells * (base_height_in_cells + 1) + (region_row - extra_height_cells) * base_height_in_cells
+                region_height_in_cells = base_height_in_cells
+
+            self.region_min_x = float(MIN_MAP_COORD + region_start_col * self.grid_cell_size)
+            self.region_max_x = float(MIN_MAP_COORD + (region_start_col + region_width_in_cells) * self.grid_cell_size)
+            self.region_min_y = float(MIN_MAP_COORD + region_start_row * self.grid_cell_size)
+            self.region_max_y = float(MIN_MAP_COORD + (region_start_row + region_height_in_cells) * self.grid_cell_size)
+
+            self.region_center_x = (self.region_min_x + self.region_max_x) / 2
+            self.region_center_y = (self.region_min_y + self.region_max_y) / 2
+
+            region_center_dist = math.sqrt((self.region_center_x - ark_x)**2 + (self.region_center_y - ark_y)**2)
+
+            # If region unreachable (>1000 units), skip region navigation
+            if region_center_dist > 1000.0:
+                print(f"  WARNING: Region unreachable, skipping to exploration")
+                self.has_reached_region = True
+            else:
+                self.has_reached_region = False
+            self.saved_exploration_pos: Optional[Tuple[float, float]] = None
+        else:
+            self.region_min_x = MIN_MAP_COORD
+            self.region_max_x = MAX_MAP_COORD
+            self.region_min_y = MIN_MAP_COORD
+            self.region_max_y = MAX_MAP_COORD
+            self.region_center_x = 500.0
+            self.region_center_y = 500.0
+            self.has_reached_region = True
+            self.saved_exploration_pos = None
+
+        h = num_helpers
+        if self.id > 0:
+            self.base_angle = (2 * math.pi * (self.id - 1)) / (int(h) - 1)
+        else:
+            self.base_angle = 0
+        self.is_exploring_fan_out = True
+
+        self.ignore_list = []
+        num_searching_helpers = max(1, num_helpers - 1)
+        self.max_explore_dis = 100 + max(0, (5 - num_searching_helpers) * 40)
+        self.max_explore_dis = min(400, self.max_explore_dis)
+
         self.visited_grid_cells: Dict[Tuple[int, int], int] = {}
-
-        # Track recent positions for distance-based weighting
         self.recent_positions: List[Tuple[float, float]] = []
-        self.max_recent_positions = 20  # Keep last 20 positions
+        self.max_recent_positions = 20
 
-        # --- Specialization Logic Initialization ---
         self.is_specialized = True
-        # Specialization limit is now a Group ID (1000, 2000, etc.), not a population count.
         self.specialization_limit = 0
-        # NEW: List of species names this helper focuses on (populated by _assign_specialization)
         self.specialization_target_species: List[str] = []
-        # List of (Species ID, Gender) tuples this helper focuses on (max 6)
         self.to_search_list: List[SpeciesGender] = []
 
         self._assign_specialization()
 
     def _assign_specialization(self):
-        """
-        Assigns the helper a specialization based on nested subsets of the rarest species.
-
-        The assignment is based on the total animal population, with helper groups
-        assigned to species falling into the Rarest 20%, then a SUBSET of that (Rarest 10%
-        of the total population), then the Rarest 5%, and finally the Rarest 2%.
-        The min_gender/species count of 6 still applies.
-        """
-        # --- 1. Pre-Check: Normal Behavior for Helpers 1 and 2 ---
         if self.id in [1, 2]:
             self.is_specialized = False
             self.specialization_limit = 0
-            # Initialize target species list for safety
             self.specialization_target_species = []
             return
 
-        # --- 2. Calculate Total Population and Species List (Rarest First) ---
-
-        # Get a list of (species_name, count) tuples and sort by count (rarest first)
-        # Filter out species below the minimum gender/species count of 6
         species_list = sorted(
             [(name, count) for name, count in self.species_stats.items()],
             key=itemgetter(1),
         )
 
-        # Calculate total population of all species that meet the min count (>= 6)
         total_population = sum(count for _, count in species_list)
 
         #NEW CODE
@@ -163,62 +186,42 @@ class Player5(Player):
             self.specialization_target_species = []
             return
 
-        # --- 3. Determine Species Rarity Groupings (Nested Subsets) ---
-
-        # specializations_map will store: {specialization_limit_ID: [list_of_species_names]}
         specializations_map: Dict[int, List[str]] = {}
+        population_percentages = [0.25, 0.10, 0.05, 0.02]
+        specialization_limits = [1000, 2000, 3000, 4000]
 
-        # Define the percentage-based *population targets* for the specialization groups
-        population_percentages = [0.25, 0.10, 0.05, 0.02]  # IMPORTANT
-        # Unique IDs for the groups (used as the new specialization_limit)
-        specialization_limits = [1000, 2000, 3000, 4000]  # placeholder
-
-        # Iterate through the defined rarity levels from largest (20%) to smallest (2%)
         for i, percent in enumerate(population_percentages):
             target_population = total_population * percent
             current_cumulative_population = 0
             target_species_names = []
 
-            # Iterate through the species from rarest to most common
             for species_name, count in species_list:
-                # Add species until the target population is met or exceeded
                 if current_cumulative_population < target_population:
                     target_species_names.append(species_name)
                     current_cumulative_population += count
                 else:
                     break
 
-            # Assign the list of species to the specialization map
             limit_id = specialization_limits[i]
             specializations_map[limit_id] = target_species_names
 
-        # --- 4. Assign Helper Specialization (Helper Distribution) ---
-
         num_specialized_helpers = self.num_helpers - 2
-        group_id = self.id - 2  # The ID for group assignment starts at 1
-
-        # Helper Distribution (20%, 20%, 20%, 40%)
+        group_id = self.id - 2
         group_percentages = [0.20, 0.20, 0.20, 0.40]
 
-        # Calculate group sizes in terms of helper count
         group_sizes = []
         current_cumulative_size = 0
 
         for i in range(len(group_percentages)):
             size = math.ceil(num_specialized_helpers * group_percentages[i])
-
-            # Adjust the last group size for rounding errors
             if i == len(group_percentages) - 1:
                 size = max(0, num_specialized_helpers - current_cumulative_size)
-
             current_cumulative_size += size
             group_sizes.append(size)
 
-        # Determine which helper group the current helper_id belongs to
         cumulative_helper_count = 0
         assigned_limit = None
 
-        # The index 'i' maps the helper group to the rarity group (0->1000, 1->2000, etc.)
         for i, size in enumerate(group_sizes):
             start_id = cumulative_helper_count + 1
             end_id = cumulative_helper_count + size
@@ -229,50 +232,36 @@ class Player5(Player):
 
             cumulative_helper_count += size
 
-        # Apply the specialization
         if assigned_limit is not None and assigned_limit in specializations_map:
             self.is_specialized = True
             self.specialization_limit = assigned_limit
-            # Store the target list of species names
             self.specialization_target_species = specializations_map.get(
                 assigned_limit, []
             )
         else:
             self.is_specialized = False
             self.specialization_limit = 0
-            self.specialization_target_species = []  # Ensure it's cleared
+            self.specialization_target_species = []
 
-        # --- 5. Update Target Priority List ---
-        # This call now uses the new self.specialization_target_species
         self._update_to_search_list()
 
     def _update_to_search_list(self):
-        """
-        Recalculates the self.to_search_list by prioritizing the needed animals
-        within the helper's assigned specialization list (self.specialization_target_species).
-
-        This method is fixed to use the pre-calculated species list instead of the old population limit.
-        """
         final_search_list: List[SpeciesGender] = []
 
-        # --- Specialized Helper Logic ---
         if (
             self.is_specialized
             and hasattr(self, "specialization_target_species")
             and self.specialization_target_species
         ):
-            # The specialization_target_species is already sorted by rarity (rarest first)
             for species_name in self.specialization_target_species:
                 species_id = self.species_to_id.get(species_name)
                 if species_id is None:
                     continue
 
-                # Check if male is needed
                 male_needed = (species_id, Gender.Male) not in self.obtained_species
                 if male_needed:
                     final_search_list.append((species_id, Gender.Male))
 
-                # Check if female is needed
                 female_needed = (species_id, Gender.Female) not in self.obtained_species
                 if female_needed:
                     final_search_list.append((species_id, Gender.Female))
@@ -282,38 +271,36 @@ class Player5(Player):
             species_id = self.species_to_id[name]
             species_info.append((count, species_id))
 
-        species_info.sort()  # Sort by count (rarest first)
+        species_info.sort()
 
         for count, species_id in species_info:
             if len(final_search_list) >= 6:
                 break
 
-            # Check if male is needed
             if (species_id, Gender.Male) not in self.obtained_species and (
                 species_id,
                 Gender.Male,
             ) not in final_search_list:
                 final_search_list.append((species_id, Gender.Male))
 
-            # Check if female is needed
             if (species_id, Gender.Female) not in self.obtained_species and (
                 species_id,
-                Gender.Male,
+                Gender.Female,
             ) not in final_search_list:
                 final_search_list.append((species_id, Gender.Female))
 
         self.to_search_list = final_search_list
 
-    # --- Player5 Helper Methods (Existing methods modified) ---
-
     def _get_distance(self, p1: Tuple[float, float], p2: Tuple[float, float]) -> float:
-        """Calculates Euclidean distance between two points."""
         return math.sqrt((p1[0] - p2[0]) ** 2 + (p1[1] - p2[1]) ** 2)
 
+    def _is_in_assigned_region(self, x: float, y: float) -> bool:
+        if self.assigned_region_id is None:
+            return True
+        return (self.region_min_x <= x < self.region_max_x and
+                self.region_min_y <= y < self.region_max_y)
+
     def _update_obtained_species_from_ark(self, ark_animals: Set):
-        """
-        Updates the set based on animals CONFIRMED to be on the Ark.
-        """
         ark_set: Set[SpeciesGender] = set()
         for animal in ark_animals:
             if animal.gender != Gender.Unknown:
@@ -322,10 +309,9 @@ class Player5(Player):
                 self.base_angle += random()
                 self.base_angle = self.base_angle % (2 * math.pi)
 
-        self.ignore_list.clear()  # Clear ignore list upon full Ark sync
+        self.ignore_list.clear()
         self.obtained_species.update(ark_set)
 
-        # --- NEW: Specialization Switch and Target Update ---
         is_returning_after_1000 = self.is_specialized and self.time_elapsed > 1000
 
         if is_returning_after_1000:
@@ -333,114 +319,78 @@ class Player5(Player):
                 f"Helper {self.id} is switching out of specialization mode after turn {self.time_elapsed}."
             )
             self.is_specialized = False
-            self.specialization_limit = 0  # Revert to normal helper logic
-            self.specialization_target_species = []  # Clear specialized list
-            self.to_search_list.clear()  # Clear specialized list
+            self.specialization_limit = 0
+            self.specialization_target_species = []
+            self.to_search_list.clear()
 
-        # If specialized and the list is depleted (min 6), update it
-        if self.is_specialized:
-            print(f"Replenish search list for Player: {self.id} ")
+        if self.is_specialized and len(self.to_search_list) < 6:
             self._update_to_search_list()
 
-        # print(f"Helper {self.id} # targets: {len(self.to_search_list)}") # Debug output if needed
-
     def _is_species_needed(self, species_id: int, gender: Gender) -> bool:
-        """
-        Checks if an animal is needed based on gender AND specialization role.
-
-        This method is fixed to use the self.to_search_list directly as the filter.
-        """
         if species_id in self.ignore_list:
             return False
 
-        # --- Specialization Filter (Uses the pre-filtered to_search_list) ---
         if self.is_specialized:
-            # The animal must be on the helper's precise target list.
             if gender != Gender.Unknown:
                 if (species_id, gender) not in self.to_search_list:
                     return False
             else:
-                # If gender is unknown (e.g., viewing from a distance), check if
-                # either required gender for this species ID is in the search list.
                 is_target = any(s_id == species_id for s_id, _ in self.to_search_list)
                 if not is_target:
                     return False
 
-        # --- Normal Ark Need Check (Applies to all, even specialized if they passed the filter) ---
         if gender == Gender.Unknown:
             male_obtained = (species_id, Gender.Male) in self.obtained_species
             female_obtained = (species_id, Gender.Female) in self.obtained_species
-
             return not (male_obtained and female_obtained)
         else:
-            # Check against the Ark list (self.obtained_species)
             return (species_id, gender) not in self.obtained_species
 
     def _get_move_to_target(
         self, current_pos: Tuple[float, float], target_pos: Tuple[float, float]
     ) -> Move:
-        """Calculates a 1km move towards the target."""
         dx = target_pos[0] - current_pos[0]
         dy = target_pos[1] - current_pos[1]
-
         dist = self._get_distance(current_pos, target_pos)
 
-        # if at target, just return target pos
         if dist < c.EPS:
             return Move(x=target_pos[0], y=target_pos[1])
 
         move_dist = min(dist, c.MAX_DISTANCE_KM)
-
         new_x = current_pos[0] + (dx / dist) * move_dist
         new_y = current_pos[1] + (dy / dist) * move_dist
 
         return Move(x=new_x, y=new_y)
 
     def _get_grid_cell(self, x: float, y: float) -> Tuple[int, int]:
-        """Convert world coordinates to grid cell coordinates."""
         grid_x = int((x - MIN_MAP_COORD) / self.grid_cell_size)
         grid_y = int((y - MIN_MAP_COORD) / self.grid_cell_size)
-        # Clamp to valid grid bounds
         grid_x = max(0, min(self.grid_width - 1, grid_x))
         grid_y = max(0, min(self.grid_height - 1, grid_y))
         return (grid_x, grid_y)
 
     def _get_grid_center(self, grid_x: int, grid_y: int) -> Tuple[float, float]:
-        """Get the center point of a grid cell in world coordinates."""
         center_x = MIN_MAP_COORD + (grid_x + 0.5) * self.grid_cell_size
         center_y = MIN_MAP_COORD + (grid_y + 0.5) * self.grid_cell_size
         return (center_x, center_y)
 
     def _update_visited_grid_cell(self, position: Tuple[float, float]):
-        """Mark the grid cell containing the given position as visited."""
         grid_x, grid_y = self._get_grid_cell(position[0], position[1])
         self.visited_grid_cells[(grid_x, grid_y)] = (
             self.visited_grid_cells.get((grid_x, grid_y), 0) + 1
         )
 
-        # Update recent positions list
         self.recent_positions.append(position)
         if len(self.recent_positions) > self.max_recent_positions:
             self.recent_positions.pop(0)
 
     def _get_cell_visit_score(self, grid_x: int, grid_y: int) -> float:
-        """
-        Calculate a score for a grid cell based on visit frequency.
-        Lower score = less visited = more desirable.
-        Returns a value between 0.0 (never visited) and 1.0 (heavily visited).
-        """
         visit_count = self.visited_grid_cells.get((grid_x, grid_y), 0)
-        # Use a logarithmic scale to prevent extreme penalties
-        # Never visited = 0.0, visited once = 0.3, visited 5+ times = 1.0
         if visit_count == 0:
             return 0.0
         return min(1.0, 0.3 + (visit_count - 1) * 0.15)
 
     def _get_distance_to_recent_positions(self, x: float, y: float) -> float:
-        """
-        Calculate the minimum distance from the given point to any recent position.
-        This helps avoid areas we've recently explored.
-        """
         if not self.recent_positions:
             return 0.0
 
@@ -454,14 +404,9 @@ class Player5(Player):
     def _get_strategic_target(
         self, current_pos: Tuple[float, float]
     ) -> Tuple[float, float]:
-        """
-        Selects a strategic target cell using grid-based exploration.
-        Prioritizes unvisited or less-visited areas while avoiding backtracking.
-        """
         current_x, current_y = current_pos
         prev_x, prev_y = self.previous_position
 
-        # Calculate previous movement direction
         prev_dx = current_x - prev_x
         prev_dy = current_y - prev_y
         prev_mag = (
@@ -470,21 +415,14 @@ class Player5(Player):
             else 1.0
         )
 
-        # Candidate grid cells to evaluate
-        candidates: List[Tuple[int, int, float]] = []  # (grid_x, grid_y, score)
+        candidates: List[Tuple[int, int, float]] = []
 
-        # Search radius in grid cells - expand when there are fewer helpers
-        # With fewer helpers, we need to look further to find good targets
-        num_searching_helpers = max(1, self.num_helpers - 1)  # Exclude Noah
-        base_radius = 3  # Base radius of 3 grid cells (~150 units)
-        # With 2 helpers, radius = 5; with 10 helpers, radius = 3
+        num_searching_helpers = max(1, self.num_helpers - 1)
+        base_radius = 3
         search_radius = int(base_radius + max(0, (5 - num_searching_helpers) * 0.3))
-        search_radius = max(3, min(6, search_radius))  # Clamp between 3 and 6
+        search_radius = max(3, min(6, search_radius))
 
-        # Get current grid cell
         current_grid_x, current_grid_y = self._get_grid_cell(current_x, current_y)
-
-        # Evaluate candidate grid cells within search radius
         for dx in range(-search_radius, search_radius + 1):
             for dy in range(-search_radius, search_radius + 1):
                 grid_x = current_grid_x + dx
@@ -676,6 +614,13 @@ class Player5(Player):
             current_pos: Current position
             direct: If True, go straight to ark. If False, spiral/arc toward ark to explore.
         """
+        # Save current position so we can resume exploration after dropoff
+        # Only save if we're in our assigned region and haven't saved yet
+        if (self.has_reached_region and
+            self.saved_exploration_pos is None and
+            self._is_in_assigned_region(current_pos[0], current_pos[1])):
+            self.saved_exploration_pos = current_pos
+
         current_dist_to_ark = self._get_distance(current_pos, self.ark_pos)
 
         if direct or current_dist_to_ark <= NEAR_ARK_DISTANCE:
@@ -861,6 +806,15 @@ class Player5(Player):
         current_x, current_y = self.position
         current_pos = (current_x, current_y)
 
+        # GREEDY MODE: If < 5 helpers and < 500 turns
+        # greedy_mode = self.num_helpers < 5 and self.time_elapsed < 500
+        greedy_mode = False
+
+        # Check if we've reached our assigned region (do this every turn)
+        if not self.has_reached_region and self.assigned_region_id is not None:
+            if self._is_in_assigned_region(current_x, current_y):
+                self.has_reached_region = True
+
         # Hard safety cap: if we're already beyond the allowed radius from
         # the Ark, abandon any active targets and return directly toward the Ark.
         # After turn 1000, use stricter 950 unit limit
@@ -903,6 +857,7 @@ class Player5(Player):
             return Release(animal=duplicate_to_release)
 
         # --- NEXT PRIORITY: IMMEDIATE OBTAIN IN CURRENT CELL (With Duplicate Check Fix) ---
+        # BUT ONLY if we've reached our assigned region!
         if len(self.flock) >= c.MAX_FLOCK_SIZE:
             # If flock is full, return to Ark
             return self._get_return_move(current_pos, direct=True)
@@ -916,7 +871,13 @@ class Player5(Player):
             except Exception:
                 current_cell_view = None
 
-            if current_cell_view and current_cell_view.animals:
+            # Only collect animals if:
+            # 1. We're in our assigned region, OR
+            # 2. We're actively chasing an animal (animal_target_cell is set), OR
+            # 3. We're in greedy mode (< 5 helpers, < 500 turns)
+            can_collect = self.has_reached_region or self.animal_target_cell is not None or greedy_mode
+
+            if current_cell_view and current_cell_view.animals and can_collect:
                 animal_to_obtain = None
 
                 # Iterate through all animals currently in the cell
@@ -980,8 +941,8 @@ class Player5(Player):
 
             return self._get_move_to_target(current_pos, target_cell_center)
 
-        # Scan for new animal target
-        if len(self.flock) < c.MAX_FLOCK_SIZE:
+        # Scan for new animal target (if we've reached our assigned region or in greedy mode)
+        if len(self.flock) < c.MAX_FLOCK_SIZE and (self.has_reached_region or greedy_mode):
             # _find_needed_animal_in_sight() uses _is_species_needed with Gender.Unknown
             new_target_cell = self._find_needed_animal_in_sight()
             if new_target_cell:
@@ -1037,7 +998,9 @@ class Player5(Player):
                     return self._get_return_move(current_pos, direct=True)
 
         # Loaded Return
-        if len(self.flock) >= 3:
+        # If less than 5 helpers, return with 2 animals instead of 3
+        flock_threshold = 2 if self.num_helpers < 5 else 3
+        if len(self.flock) >= flock_threshold:
             return self._get_return_move(current_pos)
 
         # Exploration Logic (Fan-out or Triangle)
@@ -1047,6 +1010,19 @@ class Player5(Player):
             or self._get_distance(current_pos, self.current_target_pos)
             < c.MAX_DISTANCE_KM
         ):
+            # If we have a saved exploration position and we're at the ark, resume from there
+            if self.is_in_ark() and self.saved_exploration_pos is not None:
+                resume_target = self.saved_exploration_pos
+                self.current_target_pos = resume_target
+                self.saved_exploration_pos = None  # Clear it so we don't keep going back
+                return self._get_move_to_target(current_pos, resume_target)
+
+            # If we haven't reached our assigned region yet, head there first
+            if not self.has_reached_region and self.assigned_region_id is not None:
+                region_target = (self.region_center_x, self.region_center_y)
+                self.current_target_pos = region_target
+                return self._get_move_to_target(current_pos, region_target)
+
             if self.is_exploring_fan_out:
                 angle = self.base_angle
                 new_x = current_x + math.cos(angle) * c.MAX_DISTANCE_KM
