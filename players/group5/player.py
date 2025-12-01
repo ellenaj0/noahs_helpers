@@ -131,7 +131,7 @@ class Player5(Player):
 
             # If region unreachable (>1000 units), skip region navigation
             if region_center_dist > 1000.0:
-                print(f"  WARNING: Region unreachable, skipping to exploration")
+                print("WARNING: Region unreachable, skipping to exploration")
                 self.has_reached_region = True
             else:
                 self.has_reached_region = False
