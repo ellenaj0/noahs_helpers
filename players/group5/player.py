@@ -806,6 +806,9 @@ class Player5(Player):
         current_x, current_y = self.position
         current_pos = (current_x, current_y)
 
+        # GREEDY MODE: If < 5 helpers and < 500 turns
+        greedy_mode = self.num_helpers < 5 and self.time_elapsed < 500
+
         # Check if we've reached our assigned region (do this every turn)
         if not self.has_reached_region and self.assigned_region_id is not None:
             if self._is_in_assigned_region(current_x, current_y):
@@ -869,8 +872,9 @@ class Player5(Player):
 
             # Only collect animals if:
             # 1. We're in our assigned region, OR
-            # 2. We're actively chasing an animal (animal_target_cell is set)
-            can_collect = self.has_reached_region or self.animal_target_cell is not None
+            # 2. We're actively chasing an animal (animal_target_cell is set), OR
+            # 3. We're in greedy mode (< 5 helpers, < 500 turns)
+            can_collect = self.has_reached_region or self.animal_target_cell is not None or greedy_mode
 
             if current_cell_view and current_cell_view.animals and can_collect:
                 animal_to_obtain = None
@@ -936,8 +940,8 @@ class Player5(Player):
 
             return self._get_move_to_target(current_pos, target_cell_center)
 
-        # Scan for new animal target (only if we've reached our assigned region)
-        if len(self.flock) < c.MAX_FLOCK_SIZE and self.has_reached_region:
+        # Scan for new animal target (if we've reached our assigned region or in greedy mode)
+        if len(self.flock) < c.MAX_FLOCK_SIZE and (self.has_reached_region or greedy_mode):
             # _find_needed_animal_in_sight() uses _is_species_needed with Gender.Unknown
             new_target_cell = self._find_needed_animal_in_sight()
             if new_target_cell:
@@ -993,7 +997,9 @@ class Player5(Player):
                     return self._get_return_move(current_pos, direct=True)
 
         # Loaded Return
-        if len(self.flock) >= 3:
+        # If less than 5 helpers, return with 2 animals instead of 3
+        flock_threshold = 2 if self.num_helpers < 5 else 3
+        if len(self.flock) >= flock_threshold:
             return self._get_return_move(current_pos)
 
         # Exploration Logic (Fan-out or Triangle)
